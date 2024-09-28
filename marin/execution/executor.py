@@ -74,13 +74,23 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any
+import traceback
 
 import draccus
 import ray
 import ray.remote_function
 
 from marin.utils import fsspec_exists
-from marin.execution.executor_step_status import get_status_path, read_events, append_status, get_current_status, STATUS_WAITING, STATUS_RUNNING, STATUS_FAILED, STATUS_SUCCESS
+from marin.execution.executor_step_status import (
+    get_status_path,
+    read_events,
+    append_status,
+    get_current_status,
+    STATUS_WAITING,
+    STATUS_RUNNING,
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+)
 
 logger = logging.getLogger("ray")
 
@@ -154,6 +164,7 @@ def versioned(value: Any):
 
 
 ############################################################
+
 
 def dependency_index_str(i: int) -> str:
     return f"DEP[{i}]"
@@ -331,7 +342,9 @@ class Executor:
 
 
 @ray.remote
-def execute_after_dependencies(fn: ExecutorFunction, config: dataclass, dependencies: list[ray.ObjectRef], output_path: str, should_run: bool):
+def execute_after_dependencies(
+    fn: ExecutorFunction, config: dataclass, dependencies: list[ray.ObjectRef], output_path: str, should_run: bool
+):
     """
     Run a function `fn` with the given `config`, after all the `dependencies` have finished.
     Only do stuff if `should_run` is True.
@@ -346,17 +359,21 @@ def execute_after_dependencies(fn: ExecutorFunction, config: dataclass, dependen
     # Call fn(config)
     if should_run:
         append_status(status_path, STATUS_RUNNING)
-        try:
-            if isinstance(fn, ray.remote_function.RemoteFunction):
+    try:
+        if isinstance(fn, ray.remote_function.RemoteFunction):
+            if should_run:
                 ray.get(fn.remote(config))
-            elif isinstance(fn, Callable):
+        elif isinstance(fn, Callable):
+            if should_run:
                 fn(config)
-            else:
-                raise ValueError(f"Expected a Callable or Ray function, but got {fn}")
-        except Exception as e:
-            # Failed due to some exception
-            append_status(status_path, STATUS_FAILED, message=str(e))
-            raise e
+        else:
+            raise ValueError(f"Expected a Callable or Ray function, but got {fn}")
+    except Exception as e:
+        # Failed due to some exception
+        message = traceback.format_exc()
+        if should_run:
+            append_status(status_path, STATUS_FAILED, message=message)
+        raise e
 
     # Success!
     if should_run:

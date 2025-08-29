@@ -12,12 +12,19 @@ class CustomJsonEncoder(json.JSONEncoder):
             return {"days": obj.days, "seconds": obj.seconds, "microseconds": obj.microseconds}
         if isinstance(obj, Path):
             return str(obj)
-        # Detect any array adhering to the Python Array API Standard;
-        # see https://github.com/data-apis/array-api/issues/150
-        if hasattr(obj, "__array_namespace__"):
+        # Handle dtype objects from numpy/jax/torch/etc
+        # These are type objects, not instances, so check for dtype-like attributes
+        if self._is_dtype(obj):
             return str(obj)
         try:
             return super().default(obj)
         except TypeError:
             logger.warning(f"Could not serialize object of type {type(obj)}: {obj}")
             return str(obj)
+
+    @staticmethod
+    def _is_dtype(obj):
+        """Check if obj is a dtype object from numpy/jax/torch/etc."""
+        # Dtype objects have 'name' and 'itemsize' attributes but no 'shape'
+        # This distinguishes them from array instances
+        return hasattr(obj, "name") and hasattr(obj, "itemsize") and not hasattr(obj, "shape")

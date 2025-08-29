@@ -91,6 +91,7 @@ import dataclasses
 import hashlib
 import inspect
 import json
+from json import JSONEncoder
 import logging
 import os
 import re
@@ -515,10 +516,12 @@ class Executor:
         prefix: str,
         executor_info_base_path: str,
         description: str | None = None,
+        json_encoder_cls: type[JSONEncoder] | None = None,
     ):
         self.prefix = prefix
         self.executor_info_base_path = executor_info_base_path
         self.description = description
+        self.json_encoder_cls = json_encoder_cls or CustomJsonEncoder
 
         self.configs: dict[ExecutorStep, dataclass] = {}
         self.dependencies: dict[ExecutorStep, list[ExecutorStep]] = {}
@@ -659,7 +662,7 @@ class Executor:
 
         logger.info(f"{step.name}: {get_fn_name(step.fn)}")
         logger.info(f"  output_path = {output_path}")
-        logger.info(f"  config = {json.dumps(config_version, cls=CustomJsonEncoder)}")
+        logger.info(f"  config = {json.dumps(config_version, cls=self.json_encoder_cls)}")
         for i, dep in enumerate(self.dependencies[step]):
             logger.info(f"  {dependency_index_str(i)} = {self.output_paths[dep]}")
 
@@ -796,7 +799,7 @@ class Executor:
             version["pseudo_dependencies"] = [self.versions[dep] for dep in computed_deps.pseudo_dependencies]
 
         # Compute output path
-        version_str = json.dumps(version, sort_keys=True, cls=CustomJsonEncoder)
+        version_str = json.dumps(version, sort_keys=True, cls=self.json_encoder_cls)
         hashed_version = hashlib.md5(version_str.encode()).hexdigest()[:6]
         output_path = os.path.join(self.prefix, step.name + "-" + hashed_version)
 
@@ -887,7 +890,7 @@ class Executor:
         # Set executor_info_path based on hash and caller path name (e.g., 72_baselines-8c2f3a.json)
         # import pdb; pdb.set_trace()
         executor_version_str = json.dumps(
-            list(map(asdict_without_description, self.step_infos)), sort_keys=True, cls=CustomJsonEncoder
+            list(map(asdict_without_description, self.step_infos)), sort_keys=True, cls=self.json_encoder_cls
         )
         executor_version_hash = hashlib.md5(executor_version_str.encode()).hexdigest()[:6]
         name = os.path.basename(self.executor_info.caller_path).replace(".py", "")
@@ -907,12 +910,12 @@ class Executor:
             info_path = _get_info_path(self.output_paths[step])
             fsspec_utils.mkdirs(os.path.dirname(info_path))
             with fsspec.open(info_path, "w") as f:
-                print(json.dumps(asdict(info), indent=2, cls=CustomJsonEncoder), file=f)
+                print(json.dumps(asdict(info), indent=2, cls=self.json_encoder_cls), file=f)
 
         # Write out info for the entire execution
         fsspec_utils.mkdirs(os.path.dirname(self.executor_info_path))
         with fsspec.open(self.executor_info_path, "w") as f:
-            print(json.dumps(asdict(self.executor_info), indent=2, cls=CustomJsonEncoder), file=f)
+            print(json.dumps(asdict(self.executor_info), indent=2, cls=self.json_encoder_cls), file=f)
 
     # caching saves ~10% off some tests
     @cached_property
@@ -1091,8 +1094,20 @@ class ExecutorMainConfig:
 
 
 @draccus.wrap()
-def executor_main(config: ExecutorMainConfig, steps: list[ExecutorStep], description: str | None = None):
-    """Main entry point for experiments (to standardize)"""
+def executor_main(
+    config: ExecutorMainConfig,
+    steps: list[ExecutorStep],
+    description: str | None = None,
+    json_encoder_cls: type[JSONEncoder] | None = None,
+):
+    """Main entry point for experiments (to standardize)
+
+    Args:
+        config: Configuration for the executor
+        steps: List of executor steps to run
+        description: Optional description of the experiment
+        json_encoder_cls: Optional custom JSON encoder class (not exposed via CLI)
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     time_in = time.time()
@@ -1130,6 +1145,7 @@ def executor_main(config: ExecutorMainConfig, steps: list[ExecutorStep], descrip
         prefix=prefix,
         executor_info_base_path=executor_info_base_path,
         description=description,
+        json_encoder_cls=json_encoder_cls,
     )
 
     executor.run(steps=steps, dry_run=config.dry_run, run_only=config.run_only, force_run_failed=config.force_run_failed)

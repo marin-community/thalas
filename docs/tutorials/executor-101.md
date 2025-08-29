@@ -42,7 +42,7 @@ import os
 from dataclasses import dataclass
 import fsspec
 
-from marin.execution.executor import (
+from thalas.execution.executor import (
     ExecutorStep,
     executor_main,
     output_path_of,
@@ -54,7 +54,7 @@ Key imports:
 
 - `dataclass`: For creating configuration classes
 - `fsspec`: For file system operations (local or cloud)
-- `marin.execution.executor`: Core components for building experiments
+- `thalas.execution.executor`: Core components for building experiments
 
 ## Step 1: Generating Data
 

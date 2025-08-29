@@ -14,7 +14,6 @@
 
 import os
 import sys
-import time
 from pathlib import Path
 
 import fasteners
@@ -22,61 +21,10 @@ import pytest
 import ray
 from pydantic import BaseModel
 
-from marin.evaluation.evaluators.evaluator import ModelConfig
-
-default_engine_kwargs = {"enforce_eager": True, "max_model_len": 1024}
-
-large_model_engine_kwargs = {"max_model_len": 1024, "tensor_parallel_size": 8}
-
-default_generation_params = {"max_tokens": 16}
-
-DEFAULT_BUCKET_NAME = "marin-us-east5"
-DEFAULT_DOCUMENT_PATH = "documents/test-document-path"
-
 
 class WorkerConfig(BaseModel):
     worker_count: int = 0
     cluster_address: str | None = None
-
-
-@pytest.fixture(scope="module")
-def model_config():
-    config = ModelConfig(
-        name="test-llama-200m",
-        path="gs://marin-us-east5/gcsfuse_mount/perplexity-models/llama-200m",
-        engine_kwargs=default_engine_kwargs,
-        generation_params=default_generation_params,
-    )
-    yield config
-    config.destroy()
-
-
-@pytest.fixture
-def gcsfuse_mount_model_path():
-    return "/opt/gcsfuse_mount/perplexity-models/llama-200m"
-
-
-@pytest.fixture
-def gcsfuse_mount_llama_70b_model_path():
-    return "/opt/gcsfuse_mount/models/meta-llama--Llama-3-3-70B-Instruct"
-
-
-@pytest.fixture
-def gcsfuse_mount_llama_8b_model_path():
-    return "/opt/gcsfuse_mount/models/meta-llama--Llama-3-1-8B-Instruct"
-
-
-@pytest.fixture
-def test_file_path():
-    return "gs://marin-us-east5/documents/chris-test/test_50.jsonl.gz"
-
-
-@pytest.fixture
-def current_date_time():
-    # Get the current local time and format as MM-DD-YYYY-HH-MM-SS
-    formatted_time = time.strftime("%m-%d-%Y-%H-%M-%S", time.localtime())
-
-    return formatted_time
 
 
 @pytest.fixture(scope="session")

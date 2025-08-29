@@ -1,6 +1,6 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
-exclude: ".git|tests/snapshots/.*/.*"
+exclude: ".git"
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -33,7 +33,5 @@ repos:
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-toml
-      - id: check-yaml
-        args: [ --unsafe ]
       - id: end-of-file-fixer
       - id: trailing-whitespace

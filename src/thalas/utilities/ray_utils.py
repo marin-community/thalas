@@ -36,7 +36,7 @@ def schedule_on_head_node_strategy(soft=False) -> NodeAffinitySchedulingStrategy
     """
     Create a scheduling strategy that targets the Ray head node.
 
-    We do this in Marin because usually only the head node is non-preemptible,
+    We do this in Thalas because usually only the head node is non-preemptible,
     and some actors (e.g. StatusActor) should not be preempted.
     """
 

@@ -10,8 +10,8 @@ import pytest
 import ray
 from draccus.utils import Dataclass
 
-from marin.execution import THIS_OUTPUT_PATH
-from marin.execution.executor import (
+from thalas.execution import THIS_OUTPUT_PATH
+from thalas.execution.executor import (
     Executor,
     ExecutorStep,
     InputName,
@@ -21,7 +21,7 @@ from marin.execution.executor import (
     this_output_path,
     versioned,
 )
-from marin.execution.executor_step_status import (
+from thalas.execution.executor_step_status import (
     STATUS_SUCCESS,
     get_current_status,
     get_status_path,

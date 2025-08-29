@@ -3,9 +3,6 @@ import logging
 from datetime import timedelta
 from pathlib import Path
 
-# Todo(Percy, dlwh): Can we remove this jax dependency?
-from jax.numpy import bfloat16, float32
-
 logger = logging.getLogger("ray")
 
 
@@ -15,7 +12,9 @@ class CustomJsonEncoder(json.JSONEncoder):
             return {"days": obj.days, "seconds": obj.seconds, "microseconds": obj.microseconds}
         if isinstance(obj, Path):
             return str(obj)
-        if obj in (float32, bfloat16):
+        # Detect any array adhering to the Python Array API Standard;
+        # see https://github.com/data-apis/array-api/issues/150
+        if hasattr(obj, "__array_namespace__"):
             return str(obj)
         try:
             return super().default(obj)

@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from marin.execution.executor import InputName
-from marin.utilities.executor_utils import ckpt_path_to_step_name
+from thalas.execution.executor import InputName
+from thalas.utilities.executor_utils import ckpt_path_to_step_name
 
 
 def make_input_name(name, step_name) -> InputName:

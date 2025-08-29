@@ -18,7 +18,7 @@ from datetime import datetime
 
 import fsspec
 
-from marin.utils import fsspec_exists
+from thalas.utilities import fsspec_utils
 
 STATUS_WAITING = "WAITING"  # Waiting for dependencies to finish
 STATUS_RUNNING = "RUNNING"
@@ -54,7 +54,7 @@ def get_status_path(output_path: str) -> str:
 def read_events(path: str) -> list[ExecutorStepEvent]:
     """Reads the status of a step from `path`."""
     events = []
-    if fsspec_exists(path):
+    if fsspec_utils.exists(path):
         with fsspec.open(path, "r") as f:
             for line in f:
                 events.append(ExecutorStepEvent(**json.loads(line)))

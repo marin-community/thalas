@@ -1,16 +1,16 @@
 # Executor framework
 
-Marin's executor framework manages the execution of experiments.
-This document is more about the mechanics, read [this](../explanations/experiments.md) to
+The Thalas executor framework manages the execution of experiments.
+This document is more about the mechanics, read [this][experiments.md] to
 learn more about the conventions.
 
 An **experiment** is a sequence (really, a DAG) of steps, where each **step** is
 specified by the following:
 - **name**: an identifier describing the function (and its version)
-- **function**: a normal Python function or a [Ray](https://docs.ray.io) remote function (which enables massive parallelism)
+- **function**: a normal Python function or a [Ray] remote function (which enables massive parallelism)
 - **config**: the single argument to the function, which is a dataclass; fields of the config can refer to previous steps.
 
-A key decision in Marin is that data gets passed between steps by reading and writing to the filesystem.
+A key decision in Thalas is that data gets passed between steps by reading and writing to the filesystem.
 The rationale is two-fold:
 - For very large datasets, where efficiency and robustness is a concern, we give
   the steps full control over serialization and deserialization.
@@ -24,15 +24,15 @@ and step A is responsible for reading the data from that output path.
 The name of the output path includes the step name and a hash of the
 config (at least the part of it that's explicitly versioned) and all its dependencies.
 
-In the [hello world example](../tutorials/executor-101.md), we have two steps,
+In the [hello world example][executor-101.md], we have two steps,
 generating data and compute statistics.
 
-See the documentation in [`executor.py`](https://github.com/marin-community/marin/blob/main/src/marin/execution/executor.py) for more details.
+See the documentation in [`executor.py`] for more details.
 
 ## Ray
 
 Recall that a step's function can either be a normal Python function or in most realistic cases,
-a [Ray](https://docs.ray.io/) remote function.
+a [Ray] remote function.
 Ray allows us to run a large computation distributed over a cluster and is
 generally used for large data processing tasks.  For example, we can break a large
 dataset into shards and create a Ray function to process each shard.
@@ -40,7 +40,7 @@ dataset into shards and create a Ray function to process each shard.
 Ray packages up the code from the local directory and ships it off to the appropriate machine.
 The environment will have the following packages installed:
 - **Default packages**: installed on the Ray cluster (`dependencies` in
-  [`pyproject.toml`](https://github.com/marin-community/marin/blob/main/pyproject.toml)), which include fsspec, draccus, etc.
+  [`pyproject.toml`]), which include fsspec, draccus, etc.
 - **Step-specific packages**: each `ExecutorStep` can specify
   `pip_dependency_groups`, a list of either (i) a key from
   `project.optional-dependencies` dictionary (e.g., `tokenize_train`), or (2) a
@@ -60,7 +60,7 @@ number_of_restarts = ExecutorStep(
 )
 ```
 
-Finally, to launch an experiment, use [`ray_run.py`](https://github.com/marin-community/marin/blob/main/src/marin/run/ray_run.py), which
+Finally, to launch an experiment in Marin, use [`ray_run.py`], which
 launches jobs to the Ray cluster:
 
 ```bash
@@ -71,6 +71,13 @@ This script ensure that:
 - All the relevant libraries (specified above) are installed.
 - The working directory is set appropriately.
 - Any subpaths under submodules are appended to PYTHONPATH, which is useful
-  when [co-developing with another submodule](../tutorials/co-develop.md) (e.g., levanter).
+  when [co-developing with another submodule][co-develop.md] (e.g., levanter).
 
-> **New:** Agent-friendly recipes are now available in `docs/recipes/`. See [add_dataset.md](../recipes/add_dataset.md) for a guide to dataset schema inspection and addition.
+
+[Ray]: https://docs.ray.io/
+[`executor.py`]: ../../src/thalas/execution/executor.py
+[`pyproject.toml`]: ../../pyproject.toml
+[experiments.md]: https://github.com/marin-community/marin/blob/main/docs/explanations/experiments.md
+[co-develop.md]: https://github.com/marin-community/marin/blob/main/docs/tutorials/co-develop.md
+[`ray_run.py`]: https://github.com/marin-community/marin/blob/main/marin/run/ray_run.py
+[executor-101.md]: ../tutorials/executor-101.md

@@ -107,13 +107,12 @@ from urllib.parse import urlparse
 
 import draccus
 import fsspec
-import levanter.utils.fsspec_utils as fsspec_utils
 import ray
 import ray.remote_function
 from ray.runtime_env import RuntimeEnv
 from ray.util import state  # noqa
 
-from marin.execution.executor_step_status import (
+from thalas.execution.executor_step_status import (
     STATUS_CANCELLED,
     STATUS_DEP_FAILED,
     STATUS_FAILED,
@@ -125,10 +124,11 @@ from marin.execution.executor_step_status import (
     get_latest_status_from_gcs,
     get_status_path,
 )
-from marin.execution.status_actor import PreviousTaskFailedError, StatusActor
-from marin.utilities.executor_utils import get_pip_dependencies
-from marin.utilities.json_encoder import CustomJsonEncoder
-from marin.utilities.ray_utils import is_local_ray_cluster, schedule_on_head_node_strategy
+from thalas.utilities import fsspec_utils
+from thalas.execution.status_actor import PreviousTaskFailedError, StatusActor
+from thalas.utilities.executor_utils import get_pip_dependencies
+from thalas.utilities.json_encoder import CustomJsonEncoder
+from thalas.utilities.ray_utils import is_local_ray_cluster, schedule_on_head_node_strategy
 
 logger = logging.getLogger("ray")
 
@@ -1098,7 +1098,7 @@ def executor_main(config: ExecutorMainConfig, steps: list[ExecutorStep], descrip
     time_in = time.time()
 
     ray.init(
-        namespace="marin",
+        namespace="thalas",
         ignore_reinit_error=True,
         resources={"head_node": 1} if is_local_ray_cluster() else None,
     )  # We need to init ray here to make sure we have the correct namespace for actors
@@ -1110,14 +1110,14 @@ def executor_main(config: ExecutorMainConfig, steps: list[ExecutorStep], descrip
     prefix = config.prefix
     if prefix is None:
         # infer from the environment
-        if "MARIN_PREFIX" in os.environ:
-            prefix = os.environ["MARIN_PREFIX"]
+        if "THALAS_PREFIX" in os.environ:
+            prefix = os.environ["THALAS_PREFIX"]
         else:
-            raise ValueError("Must specify a prefix or set the MARIN_PREFIX environment variable")
-    elif "MARIN_PREFIX" in os.environ:
-        if prefix != os.environ["MARIN_PREFIX"]:
+            raise ValueError("Must specify a prefix or set the THALAS_PREFIX environment variable")
+    elif "THALAS_PREFIX" in os.environ:
+        if prefix != os.environ["THALAS_PREFIX"]:
             logger.warning(
-                f"MARIN_PREFIX environment variable ({os.environ['MARIN_PREFIX']}) is different from the "
+                f"THALAS_PREFIX environment variable ({os.environ['THALAS_PREFIX']}) is different from the "
                 f"specified prefix ({prefix})"
             )
 

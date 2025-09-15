@@ -74,7 +74,7 @@ might be:
 
 - The pipeline might get too big and unwieldy, in which case we can cut it up by
   specifying a hard-coded path as the input to a step.  Or perhaps we can have
-  our cake and eat it to by putting in an "assert" statement to ensure the input
+  our cake and eat it too by putting in an "assert" statement to ensure the input
   path that's computed from upstream dependencies is what we expect.
 
 - If we decide to rename fields, we can extend `versioned` to take a string of

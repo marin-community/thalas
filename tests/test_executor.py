@@ -45,7 +45,9 @@ from thalas.execution.executor_step_status import (
 
 # Re-use the shared Ray TPU cluster for tests
 @pytest.fixture(scope="module", autouse=True)
-def ray_start(ray_tpu_cluster):
+def ray_start():
+    if not ray.is_initialized():
+        ray.init(namespace="thalas", ignore_reinit_error=True, num_cpus=8)
     yield
 
 

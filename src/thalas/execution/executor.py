@@ -1,4 +1,4 @@
-# Copyright 2025 The Thalas Authors
+# Copyright 2025-2026 The Thalas Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 """
 The `Executor` framework provides a way to specify a DAG of `ExecutorStep`s that
-are executed in a topological order using Ray.  Beyond that:
+are executed in a topological order using Fray.  Beyond that:
 
 1. The key distinguishing feature of the framework is allowing the user to
    flexibly control what steps are "new".
@@ -74,7 +74,7 @@ might be:
 
 - The pipeline might get too big and unwieldy, in which case we can cut it up by
   specifying a hard-coded path as the input to a step.  Or perhaps we can have
-  our cake and eat it too by putting in an "assert" statement to ensure the input
+  our cake and eat it to by putting in an "assert" statement to ensure the input
   path that's computed from upstream dependencies is what we expect.
 
 - If we decide to rename fields, we can extend `versioned` to take a string of
@@ -87,6 +87,7 @@ might be:
   finish executing (or even check if it is executing or failed) before running.
 """
 
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -95,219 +96,719 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
-import traceback
 import urllib.parse
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime
-from functools import cached_property
+from pathlib import Path
 from typing import Any, Generic, TypeVar
-from urllib.parse import urlparse
 
 import draccus
-import fsspec
-import ray
-import ray.remote_function
-from ray.runtime_env import RuntimeEnv
-from ray.util import state  # noqa
-
-from thalas.execution.executor_step_status import (
-    STATUS_CANCELLED,
-    STATUS_DEP_FAILED,
-    STATUS_FAILED,
-    STATUS_RUNNING,
-    STATUS_SUCCESS,
-    STATUS_UNKNOWN,
-    STATUS_WAITING,
-    append_status,
-    get_latest_status_from_gcs,
-    get_status_path,
+import thalas.utilities.fsspec_utils as fsspec_utils
+from fray.current_client import current_client
+from fray.iris_backend import FrayIrisClient
+from fray.types import TpuConfig
+from rigging.filesystem import (
+    collect_gcs_paths,
+    get_bucket_location,
+    marin_prefix,
+    mirror_budget,
+    open_url,
+    region_from_prefix,
+    split_gcs_path,
 )
-from thalas.utilities import fsspec_utils
-from thalas.execution.status_actor import PreviousTaskFailedError, StatusActor
-from thalas.utilities.executor_utils import get_pip_dependencies
+from rigging.log_setup import configure_logging
+
+from thalas.execution.context import executor_context
+from thalas.execution.executor_step_status import (
+    STATUS_SUCCESS,
+    StatusFile,
+)
+from thalas.execution.remote import RemoteCallable
+from thalas.execution.step_runner import StepRunner, worker_id
+from thalas.execution.step_spec import StepSpec, _is_relative_path
+from thalas.execution.types import (
+    ExecutorFunction,
+    ExecutorStep,
+    InputName,
+    OutputName,
+    T_co,
+    VersionedValue,
+    output_path_of,
+)
 from thalas.utilities.json_encoder import CustomJsonEncoder
-from thalas.utilities.ray_utils import is_local_ray_cluster, schedule_on_head_node_strategy
 
-logger = logging.getLogger("ray")
+logger = logging.getLogger(__name__)
 
-ConfigT = TypeVar("ConfigT", covariant=True, bound=dataclass)
-T_co = TypeVar("T_co", covariant=True)
-
-ExecutorFunction = Callable | ray.remote_function.RemoteFunction | None
+_LOCAL_DATA_BROWSER_PORT_RE = re.compile(r"^\s*port\s*:\s*(\d+)\s*(?:#.*)?$")
+_LOCAL_DATA_BROWSER_CONFIG_REL = Path("data_browser") / "conf" / "local.conf"
 
 
-@dataclass(frozen=True)
-class ExecutorStep(Generic[ConfigT]):
+def _find_data_browser_local_conf(max_parents: int = 6) -> Path | None:
+    here = Path.cwd().resolve()
+    for _ in range(max_parents + 1):
+        candidate = here / _LOCAL_DATA_BROWSER_CONFIG_REL
+        if candidate.exists():
+            return candidate
+        parent = here.parent
+        if parent == here:
+            break
+        here = parent
+    return None
+
+
+def _get_local_data_browser_port(default: int = 5000) -> int:
+    # looks for the port in the local data browser config file
+    config_path = _find_data_browser_local_conf()
+    if config_path is None:
+        return default
+
+    try:
+        with config_path.open() as fp:
+            for line in fp:
+                match = _LOCAL_DATA_BROWSER_PORT_RE.match(line)
+                if match:
+                    return int(match.group(1))
+    except OSError:
+        return default
+
+    return default
+
+
+ConfigT = TypeVar("ConfigT")
+
+
+_NON_REGIONAL_BUCKET_LOCATIONS = {"us", "eu", "asia", "nam4", "eur4", "asia1"}
+_GCP_REGION_PATTERN = re.compile(r"^[a-z]+-[a-z0-9]+[0-9]$")
+
+
+def _normalize_region(region: str, *, step_name: str, path: str) -> str:
+    normalized = region.lower()
+    if normalized in _NON_REGIONAL_BUCKET_LOCATIONS or "+" in normalized or not _GCP_REGION_PATTERN.match(normalized):
+        raise ValueError(
+            f"Executor step {step_name!r} references {path!r} in a non-regional bucket location "
+            f"({normalized!r}); cannot infer a single region pin."
+        )
+    return normalized
+
+
+def _is_bucket_location_permission_error(exc: Exception) -> bool:
+    return isinstance(exc, PermissionError) or exc.__class__.__name__ in {"Forbidden", "PermissionDenied"}
+
+
+def _region_for_gcs_path(path: str, *, step_name: str, bucket_region_cache: dict[str, str]) -> str | None:
+    region = region_from_prefix(path)
+    if region is not None:
+        return _normalize_region(region, step_name=step_name, path=path)
+
+    bucket, _ = split_gcs_path(path)
+    if bucket not in bucket_region_cache:
+        try:
+            bucket_region_cache[bucket] = get_bucket_location(path)
+        except Exception as e:
+            if _is_bucket_location_permission_error(e):
+                logger.warning(
+                    "Could not infer bucket location for %s due to permission error; "
+                    "skipping this path for region inference.",
+                    path,
+                    exc_info=True,
+                )
+                return None
+            raise
+    return _normalize_region(bucket_region_cache[bucket], step_name=step_name, path=path)
+
+
+def _infer_gcs_regions(
+    *,
+    step_name: str,
+    config: Any,
+    output_path: str,
+    deps: list[StepSpec] | None,
+    dag_tpu_regions: list[str] | None = None,
+) -> list[str] | None:
+    """Return inferred GCS regions referenced by config/deps/output, or None if no GCS paths."""
+    # label -> path evidence for useful error messages
+    path_to_labels: dict[str, list[str]] = {}
+
+    def add_path(label: str, path: str):
+        path_to_labels.setdefault(path, []).append(label)
+
+    for label, path in collect_gcs_paths(config, path_prefix="config"):
+        add_path(label, path)
+
+    for i, dep in enumerate(deps or []):
+        dep_path = dep.output_path
+        if dep_path.startswith("gs://"):
+            add_path(f"dependency[{i}]", dep_path)
+
+    if output_path.startswith("gs://"):
+        add_path("output_path", output_path)
+
+    gcs_regions: set[str] | None = None
+    region_to_evidence: dict[str, list[str]] = {}
+    if path_to_labels:
+        bucket_region_cache: dict[str, str] = {}
+        for path, labels in path_to_labels.items():
+            region = _region_for_gcs_path(path, step_name=step_name, bucket_region_cache=bucket_region_cache)
+            if region is None:
+                continue
+            region_to_evidence.setdefault(region, []).extend(f"{label}={path}" for label in labels)
+        if region_to_evidence:
+            gcs_regions = set(region_to_evidence)
+
+        if gcs_regions is not None and len(gcs_regions) > 1:
+            detail = "; ".join(
+                f"{region}: {', '.join(sorted(evidence)[:3])}" for region, evidence in sorted(region_to_evidence.items())
+            )
+            raise ValueError(
+                f"Executor step {step_name!r} has cross-region GCS dependencies. "
+                f"Found regions {{{', '.join(sorted(region_to_evidence))}}}. {detail}"
+            )
+
+    if dag_tpu_regions:
+        tpu_region_set = {r.lower() for r in dag_tpu_regions}
+        if gcs_regions is None:
+            gcs_regions = tpu_region_set
+        else:
+            intersection = gcs_regions & tpu_region_set
+            if intersection:
+                gcs_regions = intersection
+            else:
+                raise ValueError(
+                    f"Executor step {step_name!r} has no overlap between GCS regions {sorted(gcs_regions)} "
+                    f"and TPU-capable DAG regions {sorted(tpu_region_set)}."
+                )
+
+    if gcs_regions is None:
+        return None
+    return sorted(gcs_regions)
+
+
+def _allowed_regions_for_step(
+    *,
+    step_name: str,
+    remote_fn: RemoteCallable | None,
+    config: Any,
+    output_path: str,
+    deps: list[StepSpec] | None,
+    dag_tpu_regions: list[str] | None = None,
+) -> set[str] | None:
+    """Return the allowed regional placements for a step after combining all constraints."""
+    allowed_regions = _infer_gcs_regions(
+        step_name=step_name,
+        config=config,
+        output_path=output_path,
+        deps=deps,
+        dag_tpu_regions=dag_tpu_regions,
+    )
+    allowed = set(allowed_regions) if allowed_regions is not None else None
+
+    if remote_fn is None or remote_fn.resources.regions is None:
+        return allowed
+
+    explicit_regions = {region.lower() for region in remote_fn.resources.regions}
+    if not explicit_regions:
+        return allowed
+
+    if allowed is None:
+        return explicit_regions
+
+    intersection = allowed & explicit_regions
+    if intersection:
+        return intersection
+
+    raise ValueError(
+        f"Executor step {step_name!r} has no overlap between explicit regions {sorted(explicit_regions)} "
+        f"and inferred regions {sorted(allowed)}."
+    )
+
+
+def _regions_for_tpu_variant_from_iris(variant: str) -> set[str] | None:
+    try:
+        client = current_client()
+    except Exception:
+        return None
+    if not isinstance(client, FrayIrisClient):
+        return None
+
+    variant = variant.lower()
+    try:
+        # TODO: expose autoscaler status through a public Fray API.
+        autoscaler_status = client._iris._cluster_client.get_autoscaler_status()
+    except Exception:
+        logger.warning("Could not query Iris autoscaler status for TPU region inference", exc_info=True)
+        return None
+
+    regions: set[str] = set()
+    for group in autoscaler_status.status.groups:
+        if group.device_type != "tpu":
+            continue
+        group_variant = group.device_variant.lower().strip()
+        if group_variant and group_variant != variant:
+            continue
+
+        region = group.region.strip().lower()
+        if region:
+            regions.add(region)
+
+    return regions or None
+
+
+def _regions_for_tpu_variants_from_iris(
+    variants: list[str],
+    *,
+    variant_region_cache: dict[str, set[str] | None],
+) -> set[str] | None:
+    inferred_regions: set[str] = set()
+    for variant in variants:
+        normalized_variant = variant.lower()
+        if normalized_variant not in variant_region_cache:
+            variant_region_cache[normalized_variant] = _regions_for_tpu_variant_from_iris(normalized_variant)
+        cached = variant_region_cache[normalized_variant]
+        if cached is None:
+            return None
+        inferred_regions |= cached
+    return inferred_regions
+
+
+def infer_tpu_variant_regions_from_iris(variants: Sequence[str]) -> list[str] | None:
+    """Return sorted TPU-capable regions for the requested variants, if known."""
+    inferred_regions = _regions_for_tpu_variants_from_iris(
+        list(variants),
+        variant_region_cache={},
+    )
+    if not inferred_regions:
+        return None
+    return sorted(inferred_regions)
+
+
+def _tpu_regions_for_remote_callable(
+    remote_fn: RemoteCallable,
+    *,
+    variant_region_cache: dict[str, set[str] | None],
+) -> set[str] | None:
+    if not isinstance(remote_fn.resources.device, TpuConfig):
+        return None
+    if remote_fn.resources.regions:
+        return {r.lower() for r in remote_fn.resources.regions}
+
+    variants = [remote_fn.resources.device.variant]
+    if remote_fn.resources.device_alternatives:
+        variants.extend(remote_fn.resources.device_alternatives)
+    return _regions_for_tpu_variants_from_iris(variants, variant_region_cache=variant_region_cache)
+
+
+def _step_dag_tpu_regions(
+    steps: list["ExecutorStep"],
+    dependencies: dict["ExecutorStep", list["ExecutorStep"]],
+) -> dict["ExecutorStep", list[str] | None]:
+    """Infer TPU-capable regions per step from downstream TPU consumers in the same component."""
+    dependents: dict[ExecutorStep, list[ExecutorStep]] = {step: [] for step in steps}
+    for step in steps:
+        for dep in dependencies.get(step, []):
+            if dep in dependents:
+                dependents[dep].append(step)
+
+    reachable_tpu_regions: dict[ExecutorStep, set[str] | None] = {}
+    variant_region_cache: dict[str, set[str] | None] = {}
+
+    def regions_for_step(step: ExecutorStep) -> set[str] | None:
+        if step in reachable_tpu_regions:
+            return reachable_tpu_regions[step]
+
+        step_regions: set[str] | None = None
+        step_fn = step.fn
+        if isinstance(step_fn, RemoteCallable):
+            step_regions = _tpu_regions_for_remote_callable(step_fn, variant_region_cache=variant_region_cache)
+
+        downstream_tpu_regions: set[str] | None = step_regions
+        for dependent in dependents[step]:
+            dependent_regions = regions_for_step(dependent)
+            if dependent_regions is None:
+                continue
+            if downstream_tpu_regions is None:
+                downstream_tpu_regions = set(dependent_regions)
+            else:
+                downstream_tpu_regions &= dependent_regions
+            if not downstream_tpu_regions:
+                raise ValueError(f"No common region satisfies TPU consumers downstream of executor step {step.name!r}.")
+
+        reachable_tpu_regions[step] = downstream_tpu_regions
+        return downstream_tpu_regions
+
+    return {
+        step: sorted(regions) if regions else None
+        for step, regions in ((step, regions_for_step(step)) for step in steps)
+    }
+
+
+def _component_tpu_pins(
+    steps: list["ExecutorStep"],
+    dependencies: dict["ExecutorStep", list["ExecutorStep"]],
+    *,
+    configs: dict["ExecutorStep", Any],
+    output_paths: dict["ExecutorStep", str],
+    dep_stubs_by_step: dict["ExecutorStep", list[StepSpec]],
+    dag_tpu_regions_by_step: dict["ExecutorStep", list[str] | None],
+) -> dict["ExecutorStep", str | None]:
+    relevant_steps = {step for step in steps if dag_tpu_regions_by_step[step] is not None}
+    if not relevant_steps:
+        return {step: None for step in steps}
+
+    adjacency: dict[ExecutorStep, set[ExecutorStep]] = {step: set() for step in relevant_steps}
+    for step in relevant_steps:
+        for dep in dependencies.get(step, []):
+            if dep in adjacency:
+                adjacency[step].add(dep)
+                adjacency[dep].add(step)
+
+    chosen_region_by_step: dict[ExecutorStep, str | None] = {step: None for step in steps}
+    visited: set[ExecutorStep] = set()
+
+    for step in relevant_steps:
+        if step in visited:
+            continue
+
+        stack = [step]
+        component: list[ExecutorStep] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(adjacency[current] - visited)
+
+        component_regions: set[str] | None = None
+        for component_step in component:
+            remote_fn = component_step.fn if isinstance(component_step.fn, RemoteCallable) else None
+            step_regions = _allowed_regions_for_step(
+                step_name=component_step.name,
+                remote_fn=remote_fn,
+                config=configs[component_step],
+                output_path=output_paths[component_step],
+                deps=dep_stubs_by_step[component_step],
+                dag_tpu_regions=dag_tpu_regions_by_step[component_step],
+            )
+            if step_regions is None:
+                continue
+            if component_regions is None:
+                component_regions = set(step_regions)
+            else:
+                component_regions &= step_regions
+            if not component_regions:
+                component_step_names = ", ".join(sorted(s.name for s in component))
+                raise ValueError(
+                    f"No common concrete region satisfies TPU-connected executor steps: {component_step_names}."
+                )
+
+        if not component_regions:
+            continue
+
+        chosen_region = sorted(component_regions)[0]
+
+        for component_step in component:
+            chosen_region_by_step[component_step] = chosen_region
+
+    return chosen_region_by_step
+
+
+def _iris_backend_is_active() -> bool:
+    try:
+        client = current_client()
+    except Exception:
+        return False
+    return isinstance(client, FrayIrisClient)
+
+
+def _maybe_attach_inferred_region_constraint(
+    *,
+    step_name: str,
+    remote_fn: RemoteCallable,
+    config: Any,
+    output_path: str,
+    deps: list[StepSpec] | None,
+    dag_tpu_regions: list[str] | None = None,
+    forced_region: str | None = None,
+) -> RemoteCallable:
+    if not _iris_backend_is_active():
+        return remote_fn
+
+    allowed_regions = _allowed_regions_for_step(
+        step_name=step_name,
+        remote_fn=remote_fn,
+        config=config,
+        output_path=output_path,
+        deps=deps,
+        dag_tpu_regions=dag_tpu_regions,
+    )
+    if forced_region is not None:
+        pinned_region = forced_region.lower()
+        if allowed_regions is not None and pinned_region not in allowed_regions:
+            raise ValueError(
+                f"Executor step {step_name!r} cannot be pinned to {pinned_region!r}; "
+                f"allowed regions are {sorted(allowed_regions)}."
+            )
+        return dataclasses.replace(
+            remote_fn,
+            resources=dataclasses.replace(remote_fn.resources, regions=[pinned_region]),
+        )
+
+    if remote_fn.resources.regions is not None:
+        return remote_fn
+
+    if allowed_regions is None:
+        return remote_fn
+
+    logger.info(
+        "Inferred Iris region constraints %s for executor step %s from GCS path dependencies",
+        allowed_regions,
+        step_name,
+    )
+    return dataclasses.replace(
+        remote_fn,
+        resources=dataclasses.replace(remote_fn.resources, regions=sorted(allowed_regions)),
+    )
+
+
+def asdict_without_description(obj: Any) -> dict[str, Any]:
+    """Return the dict form of a dataclass, but remove the `description` field."""
+
+    def recurse(value: Any):
+        if is_dataclass(value):
+            return {f.name: recurse(getattr(value, f.name)) for f in fields(value)}
+        if isinstance(value, tuple) and hasattr(value, "_fields"):
+            return type(value)(*(recurse(v) for v in value))
+        if isinstance(value, list | tuple):
+            return type(value)(recurse(v) for v in value)
+        if isinstance(value, dict):
+            # RuntimeEnv (and other dict subclasses) require keyword-only init,
+            # so we normalize to a plain dict to avoid construction errors.
+            return {recurse(k): recurse(v) for k, v in value.items()}
+        return copy.deepcopy(value)
+
+    d = recurse(obj)
+    assert isinstance(d, dict)
+    d.pop("description", None)
+    assert isinstance(d, dict)
+    return d
+
+
+def resolve_executor_step(
+    step: "ExecutorStep",
+    config: Any,
+    output_path: str,
+    deps: list[StepSpec] | None = None,
+    dag_tpu_regions: list[str] | None = None,
+    forced_region: str | None = None,
+    mirror_budget_gb: float | None = None,
+) -> StepSpec:
+    """Convert an ExecutorStep into a StepSpec.
+
+    ``config`` should already be instantiated (no InputName / OutputName /
+    VersionedValue markers).  The old executor called ``fn(config)``; we wrap
+    that into a ``fn(output_path)`` closure expected by ``StepRunner``.
+
+    If *step* was created by :meth:`StepSpec.as_executor_step`, the original
+    ``StepSpec`` is returned directly (with deps replaced by the resolved
+    versions), preserving round-trip identity.
     """
-    An `ExecutorStep` represents a single step of a larger pipeline (e.g.,
-    transforming HTML to text).  It is specified by:
-     - a name (str), which is used to determine the `output_path`.
-     - a function `fn` (Ray remote), and
-     - a configuration `config` which gets passed into `fn`.
-     - a pip dependencies list (Optional[list[str]]) which are the pip dependencies required for the step.
-     These can be keys of project.optional-dependencies in the project's pyproject.toml file or any other pip package.
+    # Short-circuit for StepSpec -> ExecutorStep -> StepSpec round-trip.
+    original: StepSpec | None = getattr(step, "_original_step_spec", None)
+    if original is not None:
+        # Pin the executor-computed ``output_path`` — already anchored under the
+        # run prefix — rather than ``original.output_path`` (which resolves the
+        # build environment's region). Otherwise the StepSpec handed to
+        # ``StepRunner`` would write under the build region, not the run region.
+        return dataclasses.replace(
+            original,
+            deps=deps or list(original.deps),
+            override_output_path=output_path,
+            resources=original.resources,
+        )
 
-    When a step is run, we compute the following two things for each step:
-    - `version`: represents all the upstream dependencies of the step
-    - `output_path`: the path where the output of the step are stored, based on
-    the name and a hash of the version.
+    remote_callable = step.fn if isinstance(step.fn, RemoteCallable) else None
+    if remote_callable is not None:
+        remote_callable = _maybe_attach_inferred_region_constraint(
+            step_name=step.name,
+            remote_fn=remote_callable,
+            config=config,
+            output_path=output_path,
+            deps=deps,
+            dag_tpu_regions=dag_tpu_regions,
+            forced_region=forced_region,
+        )
 
-    The `config` is a dataclass object that recursively might have special
-    values of the following form:
-    - `InputName(step, name)`: a dependency on another `step`, resolve to the step.output_path / name
-    - `OutputName(name)`: resolves to the output_path / name
-    - `VersionedValue(value)`: a value that should be part of the version
-    The `config` is instantiated by replacing these special values with the
-    actual paths during execution.
+    step_fn = remote_callable.fn if remote_callable is not None else step.fn
+    assert step_fn is not None, f"Step {step.name} has no callable"
 
-    Note: `step: ExecutorStep` is interpreted as `InputName(step, None)`.
-    """
+    # Old-style ExecutorStep functions accept the resolved config as their only
+    # argument. The config already contains the output path, so we ignore the
+    # output_path parameter that StepRunner passes.
+    captured_fn = step_fn
+    captured_config = config
+    captured_budget = mirror_budget_gb
 
-    name: str
-    fn: ExecutorFunction
-    config: ConfigT
-    description: str | None = None
+    def resolved_fn(output_path):
+        if captured_budget is not None:
+            with mirror_budget(captured_budget):
+                return captured_fn(captured_config)
+        return captured_fn(captured_config)
 
-    override_output_path: str | None = None
-    """Specifies the `output_path` that should be used.  Print warning if it
-    doesn't match the automatically computed one."""
+    # If the original fn was decorated with @remote, propagate the
+    # RemoteCallable wrapper (with updated inner fn) so Fray dispatch
+    # is preserved.  Plain functions run locally in-thread.
+    final_fn: Callable = resolved_fn
+    if remote_callable is not None:
+        final_fn = dataclasses.replace(remote_callable, fn=resolved_fn)
 
-    pip_dependency_groups: list[str] | None = None
-
-    def cd(self, name: str) -> "InputName":
-        """Refer to the `name` under `self`'s output_path."""
-        return InputName(self, name=name)
-
-    def __truediv__(self, other: str) -> "InputName":
-        """Alias for `cd`. That looks more Pythonic."""
-        return InputName(self, name=other)
-
-    def __hash__(self):
-        """Hash based on the ID (every object is different)."""
-        return hash(id(self))
-
-    def with_output_path(self, output_path: str) -> "ExecutorStep":
-        """Return a copy of the step with the given output_path."""
-        return replace(self, override_output_path=output_path)
-
-    def as_input_name(self) -> "InputName":
-        return InputName(step=self, name=None)
-
-
-@dataclass(frozen=True)
-class InputName:
-    """To be interpreted as a previous `step`'s output_path joined with `name`."""
-
-    step: ExecutorStep | None
-    name: str | None
-    block_on_step: bool = True
-    """
-    If False, the step that uses this InputName
-    will not block (or attempt to execute) `step`. We use this for
-    documenting dependencies in the config, but where that step might not have technically finished...
-
-    For instance, we sometimes use training checkpoints before the training step has finished.
-
-    These "pseudo-dependencies" still impact the hash of the step, but they don't block execution.
-    """
-
-    def cd(self, name: str) -> "InputName":
-        return InputName(self.step, name=os.path.join(self.name, name) if self.name else name)
-
-    def __truediv__(self, other: str) -> "InputName":
-        """Alias for `cd` that looks more Pythonic."""
-        return self.cd(other)
-
-    @staticmethod
-    def hardcoded(path: str) -> "InputName":
-        """
-        Sometimes we want to specify a path that is not part of the pipeline but is still relative to the prefix.
-        Try to use this sparingly.
-        """
-        return InputName(None, name=path)
-
-    def nonblocking(self) -> "InputName":
-        """
-        the step will not block on (or attempt to execute) the parent step.
-
-         (Note that if another step depends on the parent step, it will still block on it.)
-        """
-        return dataclasses.replace(self, block_on_step=False)
-
-
-def get_executor_step(run: ExecutorStep | InputName) -> ExecutorStep:
-    """
-    Helper function to extract the ExecutorStep from an InputName or ExecutorStep.
-
-    Args:
-        run (ExecutorStep | InputName): The input to extract the step from.
-
-    Returns:
-        ExecutorStep: The extracted step.
-    """
-    if isinstance(run, ExecutorStep):
-        return run
-    elif isinstance(run, InputName):
-        step = run.step
-        if step is None:
-            raise ValueError(f"Hardcoded path {run.name} is not part of the pipeline")
-        return step
-    else:
-        raise ValueError(f"Unexpected type {type(run)} for run: {run}")
-
-
-def output_path_of(step: ExecutorStep, name: str | None = None) -> InputName:
-    return InputName(step=step, name=name)
-
-
-@dataclass(frozen=True)
-class OutputName:
-    """To be interpreted as part of this step's output_path joined with `name`."""
-
-    name: str | None
-
-
-def this_output_path(name: str | None = None):
-    return OutputName(name=name)
-
-
-# constant so we can use it in fields of dataclasses
-THIS_OUTPUT_PATH = OutputName(None)
-
-
-@dataclass(frozen=True)
-class VersionedValue(Generic[T_co]):
-    """Wraps a value, to signal that this value (part of a config) should be part of the version."""
-
-    value: T_co
-
-
-def versioned(value: T_co) -> VersionedValue[T_co]:
-    if isinstance(value, VersionedValue):
-        raise ValueError("Can't nest VersionedValue")
-    elif isinstance(value, InputName):
-        # TODO: We have also run into Versioned([InputName(...), ...])
-        raise ValueError("Can't version an InputName")
-
-    return VersionedValue(value)
-
-
-def ensure_versioned(value: VersionedValue[T_co] | T_co) -> VersionedValue[T_co]:
-    """
-    Ensure that the value is wrapped in a VersionedValue. If it is already wrapped, return it as is.
-    """
-    return value if isinstance(value, VersionedValue) else VersionedValue(value)
+    return StepSpec(
+        name=step.name,
+        deps=deps or [],
+        override_output_path=output_path,
+        fn=final_fn,
+        resources=step.resources,
+    )
 
 
 def unwrap_versioned_value(value: VersionedValue[T_co] | T_co) -> T_co:
     """
     Unwrap the value if it is a VersionedValue, otherwise return the value as is.
 
-    Sometimes we need to actually use a value that is wrapped in a VersionedValue before it is used in a config.
+    Recurses into dataclasses, dicts and lists to unwrap any nested VersionedValue instances.
+    This method cannot handle InputName, OutputName, or ExecutorStep instances inside VersionedValue as
+    their values depend on execution results.
     """
-    return value.value if isinstance(value, VersionedValue) else value
+
+    def recurse(obj: Any):
+        if isinstance(obj, MirroredValue):
+            return recurse(obj.value)
+        if isinstance(obj, VersionedValue):
+            return recurse(obj.value)
+        if isinstance(obj, OutputName | InputName | ExecutorStep):
+            raise ValueError(f"Cannot unwrap VersionedValue containing {type(obj)}: {obj}")
+        if is_dataclass(obj):
+            result = {}
+            for field in fields(obj):
+                val = getattr(obj, field.name)
+                result[field.name] = recurse(val)
+            return replace(obj, **result)
+        if isinstance(obj, dict):
+            return {k: recurse(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [recurse(x) for x in obj]
+        return obj
+
+    return recurse(value)  # type: ignore
+
+
+@dataclass(frozen=True)
+class MirroredValue(Generic[T_co]):
+    """Wraps a path value to signal that it should be mirrored from any marin regional bucket.
+
+    At config instantiation time, the path is resolved to the local marin prefix.
+    Before step execution, the executor copies the data from whichever region has it.
+    """
+
+    value: T_co
+    budget_gb: float = 10
+
+
+def mirrored(value: str | VersionedValue[str], budget_gb: float = 10) -> MirroredValue:
+    """Mark a path for cross-region mirroring with a transfer budget.
+
+    Usage: input_path=mirrored(versioned("documents/stackexchange/..."), budget_gb=50)
+    """
+    if isinstance(value, MirroredValue):
+        raise ValueError("Can't nest MirroredValue")
+    return MirroredValue(value=value, budget_gb=budget_gb)
+
+
+############################################################
+# Typed-event walker over placeholder configs.
+#
+# `walk_config` yields one event per placeholder occurrence; downstream
+# consumers (`upstream_steps`, `collect_dependencies_and_version`) iterate
+# instead of writing their own recursive descent.
+############################################################
+
+
+@dataclass(frozen=True)
+class InputNameEvent:
+    prefix: str
+    input_name: "InputName"
+
+
+@dataclass(frozen=True)
+class VersionedEvent:
+    prefix: str
+    value: Any
+
+
+_Event = InputNameEvent | VersionedEvent
+
+
+def walk_config(obj: Any) -> Iterator[_Event]:
+    """Yield one event per `InputName` / `VersionedValue` placeholder reached
+    while recursively walking dataclasses, lists, and dicts inside ``obj``.
+
+    Bare `ExecutorStep`s are normalized to `InputName(step, None)` events.
+    `MirroredValue`s recurse into their inner value (no event of their own).
+    """
+    yield from _walk(obj, "")
+
+
+def _walk(obj: Any, prefix: str) -> Iterator[_Event]:
+    new_prefix = prefix + "." if prefix else ""
+
+    if obj is None:
+        return
+
+    if isinstance(obj, ExecutorStep):
+        yield InputNameEvent(prefix=prefix, input_name=output_path_of(obj, None))
+        return
+
+    if isinstance(obj, InputName):
+        yield InputNameEvent(prefix=prefix, input_name=obj)
+        return
+
+    if isinstance(obj, MirroredValue):
+        yield from _walk(obj.value, prefix)
+        return
+
+    if isinstance(obj, VersionedValue):
+        yield VersionedEvent(prefix=prefix, value=obj.value)
+        return
+
+    if is_dataclass(obj) and not isinstance(obj, type):
+        for field in fields(obj):
+            yield from _walk(getattr(obj, field.name), new_prefix + field.name)
+        return
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise ValueError(f"dict keys must be strs, but got {k} (type: {type(k)})")
+            yield from _walk(v, new_prefix + k)
+        return
+
+    if isinstance(obj, list | tuple | set | frozenset):
+        for i, item in enumerate(obj):
+            yield from _walk(item, new_prefix + f"[{i}]")
+
+
+def upstream_steps(obj: Any) -> list[ExecutorStep]:
+    """Return the unique `ExecutorStep`s referenced by placeholders in ``obj``,
+    preserving discovery order.
+    """
+    seen: dict[int, ExecutorStep] = {}
+    for event in walk_config(obj):
+        if isinstance(event, InputNameEvent) and event.input_name.step is not None:
+            step = event.input_name.step
+            seen.setdefault(id(step), step)
+    return list(seen.values())
 
 
 ############################################################
@@ -326,7 +827,7 @@ class ExecutorStepInfo:
     fn_name: str
     """Rendered string of `step.fn`."""
 
-    config: dataclass
+    config: Any
     """`step.config`, but concretized (no more `InputName`, `OutputName`, or `VersionedValue`)."""
 
     description: str | None
@@ -350,7 +851,7 @@ class ExecutorInfo:
     """Contains information about an execution."""
 
     # Metadata related to the launch
-    ray_job_id: str
+    worker_id: str
     git_commit: str | None
     caller_path: str
     created_date: str
@@ -414,49 +915,60 @@ def collect_dependencies_and_version(obj: Any) -> _Dependencies:
     dependencies: list[ExecutorStep] = []
     version: dict[str, Any] = {}
 
-    def recurse(obj: Any, prefix: str):
-        new_prefix = prefix + "." if prefix else ""
-
-        if isinstance(obj, ExecutorStep):
-            obj = output_path_of(obj, None)
-
-        if isinstance(obj, VersionedValue):
-            version[prefix] = obj.value
-        elif isinstance(obj, InputName):
-            # Put string i for the i-th dependency
-            if obj.step is not None:
-                index = len(dependencies) + len(pseudo_dependencies)
-                if not obj.block_on_step:
-                    pseudo_dependencies.append(obj.step)
-                else:
-                    dependencies.append(obj.step)
-                version[prefix] = dependency_index_str(index) + ("/" + obj.name if obj.name else "")
-            else:
-                version[prefix] = obj.name
-        elif is_dataclass(obj):
-            # Recurse through dataclasses
-            for field in fields(obj):
-                value = getattr(obj, field.name)
-                recurse(value, new_prefix + field.name)
-        elif isinstance(obj, list):
-            # Recurse through lists
-            for i, x in enumerate(obj):
-                recurse(x, new_prefix + f"[{i}]")
-        elif isinstance(obj, dict):
-            # Recurse through dicts
-            for i, x in obj.items():
-                if not isinstance(i, str):
-                    raise ValueError(f"dict keys must be strs, but got {i} (type: {type(i)})")
-                recurse(x, new_prefix + i)
-
-    recurse(obj, "")
+    for event in walk_config(obj):
+        if isinstance(event, VersionedEvent):
+            version[event.prefix] = event.value
+            continue
+        assert isinstance(event, InputNameEvent)
+        input_name = event.input_name
+        if input_name.step is None:
+            version[event.prefix] = input_name.name
+            continue
+        index = len(dependencies) + len(pseudo_dependencies)
+        if not input_name.block_on_step:
+            pseudo_dependencies.append(input_name.step)
+        else:
+            dependencies.append(input_name.step)
+        version[event.prefix] = dependency_index_str(index) + ("/" + input_name.name if input_name.name else "")
 
     return _Dependencies(dependencies, pseudo_dependencies, version)
 
 
-def instantiate_config(
-    config: dataclass, output_path: str, output_paths: dict[ExecutorStep, str], prefix: str
-) -> dataclass:
+def _max_mirror_budget(config: Any) -> float | None:
+    """Extract the maximum mirror budget from MirroredValue entries in a raw config."""
+    max_budget: float | None = None
+
+    def recurse(obj: Any) -> None:
+        nonlocal max_budget
+        if obj is None:
+            return
+        if isinstance(obj, MirroredValue):
+            if max_budget is None or obj.budget_gb > max_budget:
+                max_budget = obj.budget_gb
+            return
+        if isinstance(obj, VersionedValue):
+            recurse(obj.value)
+            return
+        if isinstance(obj, InputName | ExecutorStep):
+            return
+        if is_dataclass(obj):
+            for field in fields(obj):
+                recurse(getattr(obj, field.name))
+        elif isinstance(obj, list):
+            for x in obj:
+                recurse(x)
+        elif isinstance(obj, tuple):
+            for x in obj:
+                recurse(x)
+        elif isinstance(obj, dict):
+            for x in obj.values():
+                recurse(x)
+
+    recurse(config)
+    return max_budget
+
+
+def instantiate_config(config: Any, output_path: str | None, output_paths: dict[ExecutorStep, str], prefix: str) -> Any:
     """
     Return a "real" config where all the special values (e.g., `InputName`,
     `OutputName`, and `VersionedValue`) have been replaced with
@@ -475,12 +987,25 @@ def instantiate_config(
         if isinstance(obj, ExecutorStep):
             obj = output_path_of(obj)
 
+        if isinstance(obj, MirroredValue):
+            inner = recurse(obj.value)
+            # Resolve to mirror:// protocol — MirrorFileSystem handles cross-region copying
+            if isinstance(inner, str) and not inner.startswith("mirror://"):
+                return f"mirror://{inner}"
+            return inner
+
         if isinstance(obj, InputName):
             if obj.step is None:
                 return _make_prefix_absolute_path(prefix, obj.name)
             else:
                 return join_path(output_paths[obj.step], obj.name)
         elif isinstance(obj, OutputName):
+            if output_path is None:
+                raise ValueError(
+                    f"materialize: cannot resolve OutputName({obj.name!r}) — config has no "
+                    "output_path attribute and no explicit output_path was passed. "
+                    "Resolve OutputName placeholders in the submitter before calling materialize."
+                )
             return join_path(output_path, obj.name)
         elif isinstance(obj, VersionedValue):
             return obj.value
@@ -494,11 +1019,56 @@ def instantiate_config(
         elif isinstance(obj, list):
             # Recurse through lists
             return [recurse(x) for x in obj]
+        elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
+            # Preserve NamedTuple subclasses when resolving nested values.
+            return type(obj)(*(recurse(x) for x in obj))
+        elif isinstance(obj, tuple):
+            return tuple(recurse(x) for x in obj)
         elif isinstance(obj, dict):
             # Recurse through dicts
             return dict((i, recurse(x)) for i, x in obj.items())
         else:
             return obj
+
+    return recurse(config)
+
+
+def resolve_local_placeholders(config: ConfigT, output_path: str) -> ConfigT:
+    """Resolve every placeholder that the *caller* can resolve locally:
+    ``OutputName`` substitutions and ``VersionedValue`` unwrapping.
+
+    ``InputName(step=…)`` and bare ``ExecutorStep`` references are deferred
+    for the worker's ``materialize`` call (which resolves them under the
+    worker's region). ``MirroredValue`` is preserved (rebuilt around its
+    recursed inner value); its meaning is region-aware so resolution belongs
+    on the worker.
+    """
+
+    def join_path(name: str | None) -> str:
+        return os.path.join(output_path, name) if name else output_path
+
+    def recurse(obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, OutputName):
+            return join_path(obj.name)
+        if isinstance(obj, MirroredValue):
+            return replace(obj, value=recurse(obj.value))
+        if isinstance(obj, VersionedValue):
+            return recurse(obj.value)
+        if isinstance(obj, InputName | ExecutorStep):
+            return obj
+        if is_dataclass(obj) and not isinstance(obj, type):
+            return replace(obj, **{f.name: recurse(getattr(obj, f.name)) for f in fields(obj)})
+        if isinstance(obj, list):
+            return [recurse(x) for x in obj]
+        if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+            return type(obj)(*(recurse(x) for x in obj))
+        if isinstance(obj, tuple):
+            return tuple(recurse(x) for x in obj)
+        if isinstance(obj, dict):
+            return {k: recurse(v) for k, v in obj.items()}
+        return obj
 
     return recurse(config)
 
@@ -520,7 +1090,7 @@ class Executor:
         self.executor_info_base_path = executor_info_base_path
         self.description = description
 
-        self.configs: dict[ExecutorStep, dataclass] = {}
+        self.configs: dict[ExecutorStep, Any] = {}
         self.dependencies: dict[ExecutorStep, list[ExecutorStep]] = {}
         self.versions: dict[ExecutorStep, dict[str, Any]] = {}
         # pseudo-dependencies only impact version but don't block execution of descendants
@@ -528,23 +1098,17 @@ class Executor:
         self.is_pseudo_dep: dict[ExecutorStep, bool] = {}
         self.version_strs: dict[ExecutorStep, str] = {}
         self.version_str_to_step: dict[str, ExecutorStep] = {}
+        self.hashed_versions: dict[ExecutorStep, str] = {}
         self.output_paths: dict[ExecutorStep, str] = {}
         self.steps: list[ExecutorStep] = []
-        self.refs: dict[ExecutorStep, ray.ObjectRef] = {}
         self.step_infos: list[ExecutorStepInfo] = []
         self.executor_info: ExecutorInfo | None = None
-        if not is_local_ray_cluster():
-            strategy = schedule_on_head_node_strategy()
-        else:
-            strategy = None
-        self.status_actor: StatusActor = StatusActor.options(
-            name="status_actor",
-            get_if_exists=True,
-            lifetime="detached",
-            # This is to ensure that the status actor is only schduled on the headnode
-            scheduling_strategy=strategy,
-        ).remote()
-        # TODO: Add a design docstring of how status_actor works
+        self._depth_cache: dict[ExecutorStep, int] = {}
+        # Dedupe advisory warnings emitted from compute_version. Shared upstream
+        # DAG chains (e.g. nemotron download/normalize reused across 100+ sources)
+        # otherwise repeat the same warning thousands of times.
+        self._warned_duplicate_versions: set[str] = set()
+        self._warned_override_mismatches: set[tuple[str, str]] = set()
 
     def run(
         self,
@@ -552,160 +1116,112 @@ class Executor:
         *,
         dry_run: bool = False,
         run_only: list[str] | None = None,
-        force_run_failed: bool = False,
-    ):
+        force_run_failed: bool = True,
+        max_concurrent: int | None = None,
+    ) -> dict["ExecutorStep", str]:
         """
         Run the pipeline of `ExecutorStep`s.
 
         Args:
             steps: The steps to run.
-            dry_run: If True, only print out what needs to be done.
+            dry_run: If True, walk the step graph and log what would run, without
+                touching remote filesystems or launching any work.
             run_only: If not None, only run the steps in the list and their dependencies. Matches steps' names as regex
             force_run_failed: If True, run steps even if they have already been run (including if they failed)
+            max_concurrent: Maximum number of steps to run concurrently. If None, run all ready steps in parallel.
+
+        Returns:
+            Mapping from every known `ExecutorStep` (including transitive
+            dependencies discovered while walking `steps`) to its concrete
+            output path.
         """
+        if max_concurrent is not None and max_concurrent < 1:
+            raise ValueError(f"max_concurrent must be a positive integer, got {max_concurrent}")
 
-        # Gather all the steps, compute versions and output paths for all of them.
-        logger.info(f"### Inspecting the {len(steps)} provided steps ###")
-        for step in steps:
-            if isinstance(step, InputName):  # Interpret InputName as the underlying step
-                step = step.step
-            if step is not None:
-                self.compute_version(step, is_pseudo_dep=False)
+        # Building the graph rebuilds StepSpecs (via dataclasses.replace and fresh
+        # construction), which the build-phase guard requires inside a context.
+        # Scope it to graph resolution only: step *execution* below is not a build
+        # phase, so a step fn that constructs steps at run time is still caught.
+        with executor_context():
+            # Gather all the steps, compute versions and output paths for all of them.
+            logger.info(f"### Inspecting the {len(steps)} provided steps ###")
+            for step in steps:
+                if isinstance(step, InputName):  # Interpret InputName as the underlying step
+                    step = step.step
+                if step is not None:
+                    self.compute_version(step, is_pseudo_dep=False)
 
-        self.get_infos()
-        logger.info(f"### Reading {len(self.steps)} statuses ###")
+            self.get_infos()
+            logger.info(f"### Reading {len(self.steps)} statuses ###")
 
-        if run_only is not None:
-            steps_to_run = self._compute_transitive_deps(self.steps, run_only)
-        else:
-            steps_to_run = [step for step in self.steps if not self.is_pseudo_dep[step]]
+            if run_only is not None:
+                steps_to_run = self._compute_transitive_deps(self.steps, run_only)
+            else:
+                steps_to_run = [step for step in self.steps if not self.is_pseudo_dep[step]]
 
-        if steps_to_run != self.steps:
-            logger.info(f"### Running {len(steps_to_run)} steps out of {len(self.steps)} ###")
+            if steps_to_run != self.steps:
+                logger.info(f"### Running {len(steps_to_run)} steps out of {len(self.steps)} ###")
 
-        logger.info("### Writing metadata ###")
-        self.write_infos()
+            if dry_run:
+                logger.info("### Skipping metadata write (dry run) ###")
+            else:
+                logger.info("### Writing metadata ###")
+                self.write_infos()
+
+            resolved_steps = self._resolve_steps(steps_to_run)
 
         logger.info(f"### Launching {len(steps_to_run)} steps ###")
-        self._run_steps(steps_to_run, dry_run=dry_run, force_run_failed=force_run_failed)
+        if max_concurrent is not None:
+            logger.info(f"### Max concurrent steps: {max_concurrent} ###")
 
-        logger.info("### Waiting for all steps to finish ###")
-        ray.get(list(self.refs.values()))
+        StepRunner().run(
+            resolved_steps,
+            dry_run=dry_run,
+            force_run_failed=force_run_failed,
+            max_concurrent=max_concurrent,
+        )
+        return self.output_paths
 
-    def _run_steps(
-        self,
-        steps_to_run: list[ExecutorStep],
-        *,
-        dry_run: bool,
-        force_run_failed: bool,
-    ) -> None:
-        remaining_deps: dict[ExecutorStep, set[ExecutorStep]] = {
-            step: set(dep for dep in self.dependencies[step] if dep in steps_to_run) for step in steps_to_run
+    def _resolve_steps(self, steps: list[ExecutorStep]) -> list[StepSpec]:
+        """Convert computed ExecutorStep state into a flat list of StepSpec."""
+        dag_tpu_regions_by_step = _step_dag_tpu_regions(steps, self.dependencies)
+        dep_stubs_by_step = {
+            step: [
+                StepSpec(name=dep.name, override_output_path=self.output_paths[dep])
+                for dep in self.dependencies[step]
+                if dep in self.output_paths
+            ]
+            for step in steps
         }
-        dependents: dict[ExecutorStep, list[ExecutorStep]] = {step: [] for step in steps_to_run}
-        for step, deps in remaining_deps.items():
-            for dep in deps:
-                dependents[dep].append(step)
-
-        ready = [step for step, deps in remaining_deps.items() if not deps]
-        running: dict[ExecutorStep, tuple[ray.ObjectRef, bool]] = {}
-
-        while ready or running:
-            while ready:
-                step = ready.pop()
-                ref, ran = self._launch_step(step, dry_run=dry_run, force_run_failed=force_run_failed)
-                self.refs[step] = ref
-                running[step] = (ref, ran)
-
-            if not running:
-                break
-
-            done_refs = self._filter_unique_waitables(running)
-            for ref in done_refs:
-                finished_step = next(step for step, r in running.items() if r[0] == ref)
-                status_path = get_status_path(self.output_paths[finished_step])
-                ran = running[finished_step][1]
-                try:
-                    ray.get(ref)
-                except Exception:
-                    message = traceback.format_exc()
-                    append_status(status_path, STATUS_FAILED, message=message)
-                    raise
-                else:
-                    if ran:
-                        append_status(status_path, STATUS_SUCCESS)
-
-                running.pop(finished_step)
-                for child in dependents.get(finished_step, []):
-                    remaining_deps[child].remove(finished_step)
-                    if not remaining_deps[child]:
-                        ready.append(child)
-
-    def _filter_unique_waitables(self, running):
-        # Ray now requires the waitables be unique, so we filter them out.
-        unique_refs = set()
-        out = []
-        for ref, _ in running.values():
-            if ref not in unique_refs:
-                unique_refs.add(ref)
-                out.append(ref)
-        done_refs, _ = ray.wait(out, num_returns=1)
-        return done_refs
-
-    def _launch_step(self, step: ExecutorStep, *, dry_run: bool, force_run_failed: bool) -> tuple[ray.ObjectRef, bool]:
-        config = self.configs[step]
-        config_version = self.versions[step]["config"]
-        output_path = self.output_paths[step]
-
-        logger.info(f"{step.name}: {get_fn_name(step.fn)}")
-        logger.info(f"  output_path = {output_path}")
-        logger.info(f"  config = {json.dumps(config_version, cls=CustomJsonEncoder)}")
-        for i, dep in enumerate(self.dependencies[step]):
-            logger.info(f"  {dependency_index_str(i)} = {self.output_paths[dep]}")
-
-        if step.pip_dependency_groups is not None:
-            pip_dependencies = get_pip_dependencies(step.pip_dependency_groups)
-        else:
-            pip_dependencies = None
-
-        if not dry_run:
-            step_name = f"{step.name}: {get_fn_name(step.fn)}"
-
-            ray_task_id = ray.get_runtime_context().get_task_id()
-            should_execute = should_run(output_path, step_name, self.status_actor, ray_task_id, force_run_failed)
-            status_path = get_status_path(output_path)
-            if not should_execute:
-                append_status(
-                    status_path,
-                    STATUS_SUCCESS,
-                    ray_task_id=ray_task_id,
-                    message="Step was already successful",
-                )
-                return self._dry_run_result, False
-
-            append_status(status_path, STATUS_RUNNING, ray_task_id=ray_task_id)
-
-            runtime_env = RuntimeEnv(pip=pip_dependencies)
-
-            # uv doesn't reuse dependencies and ends up installing CUDA-enabled
-            # torch, which is huge and causes OOMs, so disable it for now.
-            # if os.system("which uv >/dev/null 2>&1") == 0:
-            #     runtime_env["py_executable"] = "uv run --active"
-
-            if isinstance(step.fn, ray.remote_function.RemoteFunction):
-                ref = step.fn.options(
-                    name=f"{get_fn_name(step.fn, short=True)}:{step.name}", runtime_env=runtime_env
-                ).remote(config)
+        forced_region_by_step = _component_tpu_pins(
+            steps,
+            self.dependencies,
+            configs=self.configs,
+            output_paths=self.output_paths,
+            dep_stubs_by_step=dep_stubs_by_step,
+            dag_tpu_regions_by_step=dag_tpu_regions_by_step,
+        )
+        # First pass: create StepSpecs without deps so we have a mapping
+        spec_by_step: dict[ExecutorStep, StepSpec] = {}
+        for step in steps:
+            spec_by_step[step] = resolve_executor_step(
+                step=step,
+                config=self.configs[step],
+                output_path=self.output_paths[step],
+                deps=dep_stubs_by_step[step],
+                dag_tpu_regions=dag_tpu_regions_by_step[step],
+                forced_region=forced_region_by_step[step],
+                mirror_budget_gb=_max_mirror_budget(step.config),
+            )
+        # Second pass: rebuild with deps pointing to resolved StepSpecs
+        result = []
+        for step in steps:
+            dep_specs = [spec_by_step[dep] for dep in self.dependencies[step] if dep in spec_by_step]
+            if dep_specs:
+                result.append(dataclasses.replace(spec_by_step[step], deps=dep_specs))
             else:
-                remote_fn = ray.remote(step.fn)
-                ref = remote_fn.options(
-                    name=f"{get_fn_name(step.fn, short=True)}:{step.name}",
-                    runtime_env=runtime_env,
-                ).remote(config)
-
-            return ref, True
-
-        return self._dry_run_result, False
+                result.append(spec_by_step[step])
+        return result
 
     def _compute_transitive_deps(self, steps: list[ExecutorStep], run_steps: list[str]) -> list[ExecutorStep]:
         """
@@ -747,7 +1263,8 @@ class Executor:
             info = self.step_infos[self.steps.index(step)]
 
             # only run if the step hasn't already been run
-            if get_status(info.output_path, None, {}) not in [STATUS_SUCCESS]:
+            status_file = StatusFile(info.output_path, worker_id="check")
+            if status_file.status != STATUS_SUCCESS:
                 for dep in self.dependencies[step]:
                     dfs(dep)
                 to_run.append(step)
@@ -785,15 +1302,19 @@ class Executor:
         # The version specifies precisely all the information that uniquely
         # identifies this step.  Note that the fn name is not part of the
         # version.
+        #
+        # For deep dependency chains (depth > 4), we use output_paths (which
+        # already encode the version hash) instead of the full nested version
+        # dicts to avoid exponential blowup of the version structure.
         version = {
             "name": step.name,
             "config": computed_deps.version,
-            "dependencies": [self.versions[dep] for dep in computed_deps.dependencies],
+            "dependencies": [self._dep_version(dep) for dep in computed_deps.dependencies],
         }
 
         if computed_deps.pseudo_dependencies:
             # don't put this in the literal to avoid changing the hash for runs without pseudo-deps
-            version["pseudo_dependencies"] = [self.versions[dep] for dep in computed_deps.pseudo_dependencies]
+            version["pseudo_dependencies"] = [self._dep_version(dep) for dep in computed_deps.pseudo_dependencies]
 
         # Compute output path
         version_str = json.dumps(version, sort_keys=True, cls=CustomJsonEncoder)
@@ -806,10 +1327,13 @@ class Executor:
             override_path = _make_prefix_absolute_path(self.prefix, override_path)
 
             if output_path != override_path:
-                logger.warning(
-                    f"Output path {output_path} doesn't match given "
-                    f"override {step.override_output_path}, using the latter."
-                )
+                mismatch_key = (output_path, override_path)
+                if mismatch_key not in self._warned_override_mismatches:
+                    self._warned_override_mismatches.add(mismatch_key)
+                    logger.warning(
+                        f"Output path {output_path} doesn't match given "
+                        f"override {step.override_output_path}, using the latter."
+                    )
                 output_path = override_path
 
         # Record everything
@@ -820,7 +1344,8 @@ class Executor:
         if version_str not in self.version_str_to_step:
             self.steps.append(step)
             self.version_str_to_step[version_str] = step
-        else:
+        elif version_str not in self._warned_duplicate_versions:
+            self._warned_duplicate_versions.add(version_str)
             logger.warning(
                 f"Multiple `ExecutorStep`s (named {step.name}) have the same version; try to instantiate only once."
             )
@@ -834,8 +1359,37 @@ class Executor:
         self.dependencies[step] = list(map(self.canonicalize, computed_deps.dependencies))
         self.versions[step] = version
         self.version_strs[step] = version_str
+        self.hashed_versions[step] = hashed_version
         self.output_paths[step] = output_path
         self.is_pseudo_dep[step] = is_pseudo_dep
+
+    _MAX_INLINE_DEPTH = 4
+
+    def _dep_depth(self, step: ExecutorStep) -> int:
+        """Return the maximum dependency chain depth for a step (cached)."""
+        if step in self._depth_cache:
+            return self._depth_cache[step]
+        deps = self.dependencies.get(step, [])
+        if not deps:
+            depth = 0
+        else:
+            depth = 1 + max(self._dep_depth(dep) for dep in deps)
+        self._depth_cache[step] = depth
+        return depth
+
+    def _dep_version(self, dep: ExecutorStep) -> dict[str, Any] | str:
+        """Full version dict for shallow deps, region-stable name+hash for deep ones.
+
+        Using ``output_paths[dep]`` here would bake the bucket prefix
+        (e.g. ``gs://marin-us-central1``) into the hashed version, so the same
+        logical pipeline rehashed under a different ``MARIN_PREFIX`` would
+        produce a different identity. ``{name}-{hashed_version}`` is the
+        region-independent suffix that already encodes the dep's full transitive
+        version.
+        """
+        if self._dep_depth(dep) <= self._MAX_INLINE_DEPTH:
+            return self.versions[dep]
+        return f"{dep.name}-{self.hashed_versions[dep]}"
 
     def canonicalize(self, step: ExecutorStep) -> ExecutorStep:
         """Multiple instances of `ExecutorStep` might have the same version."""
@@ -865,7 +1419,7 @@ class Executor:
             caller_path=path,
             created_date=datetime.now().isoformat(),
             user=get_user(),
-            ray_job_id=ray.get_runtime_context().get_job_id(),
+            worker_id=worker_id(),
             prefix=self.prefix,
             description=self.description,
             steps=self.step_infos,
@@ -873,11 +1427,10 @@ class Executor:
 
     def get_experiment_url(self) -> str:
         """Return the URL where the experiment can be viewed."""
-        # TODO: remove hardcoding
         if self.prefix.startswith("gs://"):
             host = "https://marin.community/data-browser"
         else:
-            host = "http://localhost:5000"
+            host = f"http://localhost:{_get_local_data_browser_port()}"
 
         return host + "/experiment?path=" + urllib.parse.quote(self.executor_info_path)
 
@@ -885,10 +1438,13 @@ class Executor:
         """Output JSON files (one for the entire execution, one for each step)."""
 
         # Set executor_info_path based on hash and caller path name (e.g., 72_baselines-8c2f3a.json)
-        # import pdb; pdb.set_trace()
-        executor_version_str = json.dumps(
-            list(map(asdict_without_description, self.step_infos)), sort_keys=True, cls=CustomJsonEncoder
-        )
+        # we pre-compute the asdict as it can be expensive.
+        executor_info_dict = asdict_without_description(self.executor_info)
+        step_infos = executor_info_dict["steps"]
+        for s in step_infos:
+            s.pop("description", None)
+
+        executor_version_str = json.dumps(step_infos, sort_keys=True, cls=CustomJsonEncoder)
         executor_version_hash = hashlib.md5(executor_version_str.encode()).hexdigest()[:6]
         name = os.path.basename(self.executor_info.caller_path).replace(".py", "")
         self.executor_info_path = os.path.join(
@@ -898,162 +1454,35 @@ class Executor:
 
         # Print where to find the executor info (experiments JSON)
         logger.info(f"Writing executor info to {self.executor_info_path}")
+        if not self.prefix.startswith("gs://"):
+            logger.info("Start data browser: cd data_browser && uv run python run-dev.py --config conf/local.conf")
         logger.info("To view the experiment page, go to:")
         logger.info("")
         logger.info(self.get_experiment_url())
         logger.info("")
         # Write out info for each step
-        for step, info in zip(self.steps, self.step_infos, strict=True):
+        for step, info in zip(self.steps, executor_info_dict["steps"], strict=True):
             info_path = _get_info_path(self.output_paths[step])
             fsspec_utils.mkdirs(os.path.dirname(info_path))
-            with fsspec.open(info_path, "w") as f:
-                print(json.dumps(asdict(info), indent=2, cls=CustomJsonEncoder), file=f)
+            with open_url(info_path, "w") as f:
+                print(json.dumps(info, indent=2, cls=CustomJsonEncoder), file=f)
 
         # Write out info for the entire execution
         fsspec_utils.mkdirs(os.path.dirname(self.executor_info_path))
-        with fsspec.open(self.executor_info_path, "w") as f:
-            print(json.dumps(asdict(self.executor_info), indent=2, cls=CustomJsonEncoder), file=f)
-
-    # caching saves ~10% off some tests
-    @cached_property
-    def _dry_run_result(self):
-        return ray.put(None)
+        with open_url(self.executor_info_path, "w") as f:
+            print(json.dumps(executor_info_dict, indent=2, cls=CustomJsonEncoder), file=f)
 
 
-def asdict_without_description(obj: dataclass) -> dict[str, Any]:
-    """Return the `asdict` of an object, but remove the `description` field, because it doesn't affect the semantics."""
-    d = asdict(obj)
-    d.pop("description", None)
-    return d
-
-
-def _get_ray_status(current_owner_task_id: str | None) -> str | None:
-    """Get the status of a Ray task."""
-
-    current_owner_ray_status = None
-    if current_owner_task_id is None:
-        return current_owner_ray_status
-
-    try:
-        current_owner = ray.util.state.get_task(current_owner_task_id)
-        if type(current_owner) is list:  # Due to retries in ray, task_state can be a list of states
-            current_owner = current_owner[-1]
-    except ray.util.state.exception.RayStateApiException:
-        current_owner = None
-
-    if current_owner is None:  # We need to retry. Ray still does not have the status of the task
-        current_owner_ray_status = STATUS_UNKNOWN
-    elif current_owner.state == "FINISHED":
-        current_owner_ray_status = STATUS_SUCCESS
-    elif current_owner.state == "FAILED":
-        current_owner_ray_status = STATUS_FAILED
-    else:  # We give status as Running to task that are even waiting for dependencies
-        current_owner_ray_status = STATUS_RUNNING
-
-    return current_owner_ray_status
-
-
-def get_status(output_path: str, current_owner_task_id: str | None, states: dict) -> str | None:
-    """Get the status of an output Path. This retruns the status of the output path
-    there is no status anywhere (i.e. brand-new step) -> return None
-    a task is currently running a step -> return WAITING
-    no task is currently running it, but there is a status on disk -> return disk status
-    """
-
-    current_owner_ray_status = _get_ray_status(current_owner_task_id)
-
-    num_unknown = states.get("num_unknown", 0)  # Number of times the status was unknown
-    # We check how many times has times ray has returned status Unknown in a row. If it returns more than 20 times,
-    # We assume ray has lost that task and we use GCP status instead.
-    if current_owner_ray_status == STATUS_UNKNOWN:
-        num_unknown += 1
-        states["num_unknown"] = num_unknown
-        if num_unknown > 20:
-            current_owner_ray_status = None
-            states["num_unknown"] = 0
-    else:
-        states["num_unknown"] = 0  # Reset the counter
-
-    # Immediately return if the ray status is unknown or running, we don't need to check GCS
-    if current_owner_ray_status in [STATUS_UNKNOWN, STATUS_RUNNING]:
-        return current_owner_ray_status
-
-    # If the ray status is terminal [Failed, Success], we check the status on GCS and trust it
-
-    current_owner_gcs_status = get_latest_status_from_gcs(output_path)
-
-    if current_owner_gcs_status in [STATUS_RUNNING, STATUS_WAITING]:
-        logger.info(
-            f"Status of {output_path = } is {current_owner_gcs_status} as per GCP. "
-            "But as per Ray, the task has terminated, it's likely that this task was cancelled previously"
-        )
-        current_owner_gcs_status = STATUS_CANCELLED
-
-    return current_owner_gcs_status
-
-
-def should_run(
-    output_path: str, step_name: str, status_actor: StatusActor, ray_task_id: str, force_run_failed: bool = False
-):
-    """Check if the step should run or not based on the status of the step."""
-    """Logic for should run:
-    1. Check which task is currently the owner of this step (current_owner_task_id).
-    2. If ray_status(current_owner_task_id) is Running , we wait.
-    3. if ray_status(current_owner_task_id) is Terminated (Failed, Successful), we trust the status on GCP
-    4. A special case where ray_status(current_owner_task_id) is Terminated, but GCP status is Running, We return
-    CANCELLED"""
-
-    log_once = True
-    get_status_states = {}  # States used by get_status, since get_status is stateless we keep them here
-    while True:
-        current_owner_task_id = ray.get(status_actor.get_task_id_with_lock.remote(output_path=output_path))
-
-        # get_status also updates get_status_states via internal mutation
-        status = get_status(output_path, current_owner_task_id, get_status_states)
-
-        if log_once:
-            logger.info(f"Status {step_name} : {status}.")
-            log_once = False
-
-        if status in [STATUS_RUNNING, STATUS_WAITING, STATUS_UNKNOWN]:
-            time.sleep(5)
-            continue
-
-        # If the current owner is finished or is None, try to become the owner.
-        # If we can't become the owner, then loop again
-        if ray.get(status_actor.get_lock_by_replacing_task_id.remote(output_path, ray_task_id, current_owner_task_id)):
-            break
-
-    if status is None:
-        return True
-    elif status == STATUS_CANCELLED:
-        logger.info(f"Step {step_name} was cancelled previously. Retrying.")
-        return True
-    elif status in [STATUS_FAILED, STATUS_DEP_FAILED]:
-        if force_run_failed:
-            logger.info(f"Force running {step_name}, previous status: {status}")
-            return True
-        else:
-            raise PreviousTaskFailedError(f"Step {step_name} failed previously. Status: {status}")
-    else:
-        logger.info(f"Step {step_name} has already succeeded. Status: {status}")
-        return False
-
-
-def get_fn_name(fn: Callable | ray.remote_function.RemoteFunction, short: bool = False):
+def get_fn_name(fn: ExecutorFunction, short: bool = False):
     """Just for debugging: get the name of the function."""
     if fn is None:
         return "None"
-    if isinstance(fn, ray.remote_function.RemoteFunction):
-        if short:
-            return f"{fn._function.__name__}"
-        else:
-            return f"{fn._function.__module__}.{fn._function.__qualname__}"
+    if isinstance(fn, RemoteCallable):
+        return fn.fn.__name__
+    if short:
+        return f"{fn.__name__}"
     else:
-        if short:
-            return f"{fn.__name__}"
-        else:
-            return f"{fn.__module__}.{fn.__qualname__}"
+        return str(fn)
 
 
 def get_git_commit() -> str | None:
@@ -1065,8 +1494,17 @@ def get_git_commit() -> str | None:
 
 
 def get_caller_path() -> str:
-    """Return the path of the file that called this function."""
-    return inspect.stack()[-1].filename
+    """Return the path of the file that called this function.
+
+    Walks the stack from the outermost frame inward, returning the first
+    frame that corresponds to a real file (skips ``<frozen runpy>`` and
+    similar synthetic frames produced by ``python -m`` invocation).
+    """
+    for frame_info in reversed(inspect.stack()):
+        if not frame_info.filename.startswith("<"):
+            return frame_info.filename
+    # All frames are synthetic (shouldn't happen in practice) — fall back to argv.
+    return sys.argv[0]
 
 
 def get_user() -> str | None:
@@ -1085,41 +1523,37 @@ class ExecutorMainConfig:
     """Where the executor info should be stored under a file determined by a hash."""
 
     dry_run: bool = False
-    force_run_failed: bool = False  # Force run failed steps
+    force_run_failed: bool = True  # Force run failed steps
     run_only: list[str] | None = None
     """Run these steps (matched by regex.search) and their dependencies only. If None, run all steps."""
 
+    max_concurrent: int | None = None
+    """Maximum number of steps to run concurrently. If None, run all ready steps in parallel (default)."""
+
 
 @draccus.wrap()
-def executor_main(config: ExecutorMainConfig, steps: list[ExecutorStep], description: str | None = None):
-    """Main entry point for experiments (to standardize)"""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+def executor_main(
+    config: ExecutorMainConfig,
+    steps: list[ExecutorStep],
+    description: str | None = None,
+    max_concurrent: int | None = None,
+):
+    """Main entry point for experiments (to standardize).
 
+    Args:
+        config: Parsed CLI config (draccus). Carries `--dry_run`, `--max_concurrent`, etc.
+        steps: Steps to execute.
+        description: Optional human-readable description recorded in executor info.
+        max_concurrent: Programmatic cap on concurrent step execution. If provided,
+            takes precedence over `config.max_concurrent`. Use this to express
+            "run all of these with cap N" inside an experiment script without
+            requiring users to pass `--max_concurrent N` on the CLI.
+    """
+
+    configure_logging(level=logging.INFO)
     time_in = time.time()
 
-    ray.init(
-        namespace="thalas",
-        ignore_reinit_error=True,
-        resources={"head_node": 1} if is_local_ray_cluster() else None,
-    )  # We need to init ray here to make sure we have the correct namespace for actors
-    # (status_actor in particular)
-    time_out = time.time()
-    logger.info(f"Ray init took {time_out - time_in:.2f}s")
-    time_in = time.time()
-
-    prefix = config.prefix
-    if prefix is None:
-        # infer from the environment
-        if "THALAS_PREFIX" in os.environ:
-            prefix = os.environ["THALAS_PREFIX"]
-        else:
-            raise ValueError("Must specify a prefix or set the THALAS_PREFIX environment variable")
-    elif "THALAS_PREFIX" in os.environ:
-        if prefix != os.environ["THALAS_PREFIX"]:
-            logger.warning(
-                f"THALAS_PREFIX environment variable ({os.environ['THALAS_PREFIX']}) is different from the "
-                f"specified prefix ({prefix})"
-            )
+    prefix = config.prefix or marin_prefix()
 
     executor_info_base_path = config.executor_info_base_path
     if executor_info_base_path is None:
@@ -1132,26 +1566,150 @@ def executor_main(config: ExecutorMainConfig, steps: list[ExecutorStep], descrip
         description=description,
     )
 
-    executor.run(steps=steps, dry_run=config.dry_run, run_only=config.run_only, force_run_failed=config.force_run_failed)
+    effective_max_concurrent = max_concurrent if max_concurrent is not None else config.max_concurrent
+
+    executor.run(
+        steps=steps,
+        dry_run=config.dry_run,
+        run_only=config.run_only,
+        force_run_failed=config.force_run_failed,
+        max_concurrent=effective_max_concurrent,
+    )
     time_out = time.time()
     logger.info(f"Executor run took {time_out - time_in:.2f}s")
-    # print json path again so it's easy to copy
-    logger.info(f"Executor info written to {executor.executor_info_path}")
-    logger.info(f"View the experiment at {executor.get_experiment_url()}")
-
-
-def _is_relative_path(url_or_path):
-    # if it's a url, it's not a relative path
-    parsed_url = urlparse(url_or_path)
-
-    if parsed_url.scheme:
-        return False
-
-    # otherwise if it starts with a slash, it's not a relative path
-    return not url_or_path.startswith("/")
+    if not config.dry_run:
+        # print json path again so it's easy to copy
+        logger.info(f"Executor info written to {executor.executor_info_path}")
+        if not executor.prefix.startswith("gs://"):
+            logger.info("Start data browser: cd data_browser && uv run python run-dev.py --config conf/local.conf")
+        logger.info(f"View the experiment at {executor.get_experiment_url()}")
 
 
 def _make_prefix_absolute_path(prefix, override_path):
     if _is_relative_path(override_path):
         override_path = os.path.join(prefix, override_path)
     return override_path
+
+
+############################################################
+# Materialize: helpers that drive an Executor instance to resolve
+# placeholder configs at runtime.
+############################################################
+
+
+def compute_output_path(
+    name: str,
+    config: Any,
+    *,
+    override_output_path: str | None = None,
+    prefix: str | None = None,
+) -> str:
+    """Compute the concrete output path a step with this name+config will produce.
+
+    Drives ``Executor.compute_version`` (which walks the config's dependency
+    graph and hashes versioned values — no GCS I/O, no job submission) far
+    enough to populate the resulting output path. Honors ``override_output_path``
+    if provided. Otherwise resolves ``prefix`` from ``marin_prefix()`` and
+    derives the path from ``name`` + a hash of the config's versioned values,
+    matching ``Executor``'s scheme so a step run via ``Executor.run`` and a
+    path computed here agree on the same value.
+    """
+    resolved_prefix = prefix if prefix is not None else marin_prefix()
+    executor_info_base_path = os.path.join(resolved_prefix, "experiments")
+    executor = Executor(
+        prefix=resolved_prefix,
+        executor_info_base_path=executor_info_base_path,
+    )
+    with executor_context():
+        step = ExecutorStep(
+            name=name,
+            fn=_noop_step_fn,
+            config=config,
+            override_output_path=override_output_path,
+        )
+    executor.compute_version(step, is_pseudo_dep=False)
+    return executor.output_paths[step]
+
+
+def _noop_step_fn(config: Any) -> None:
+    """Placeholder fn used by ``compute_output_path``.
+
+    The step is discarded after path computation; this fn is never called.
+    """
+    return None
+
+
+def materialize(
+    config: ConfigT,
+    *,
+    prefix: str | None = None,
+    output_path: str | None = None,
+) -> ConfigT:
+    """Run any ``ExecutorStep``s embedded in ``config``, then return a copy of
+    ``config`` with all placeholder paths substituted.
+
+    Composes three pieces:
+
+      1. ``upstream_steps(config)`` — find embedded ``ExecutorStep``s.
+      2. ``Executor(prefix=...).run(steps)`` — submit them as sub-jobs and
+         block on completion.
+      3. ``instantiate_config(config, output_path=<resolved>,
+         output_paths=executor.output_paths, prefix=prefix)`` — substitute
+         ``InputName`` / ``OutputName`` / ``VersionedValue`` / ``ExecutorStep``
+         placeholders using the just-computed paths.
+
+    Args:
+        config: A launcher config dataclass that may embed ``ExecutorStep``s
+            and placeholder values.
+        prefix: Storage prefix for newly-submitted sub-jobs. Defaults to
+            ``marin_prefix()`` (the worker's regional ``gs://marin-{R}``
+            bucket), so upstream data is co-located with training.
+        output_path: Concrete output path for the current step, used to
+            resolve ``OutputName(name=...)`` placeholders inside ``config``.
+            If ``None``, ``materialize`` reads ``config.output_path``. For
+            callers whose config type does not expose ``output_path``, pass
+            it explicitly.
+
+    Returns:
+        A copy of ``config`` with all placeholders substituted to concrete
+        paths. A config containing no placeholders round-trips unchanged
+        (idempotent — no sub-jobs submitted).
+    """
+    resolved_prefix = prefix if prefix is not None else marin_prefix()
+
+    steps = upstream_steps(config)
+
+    # Idempotence guard: if no sub-steps reference the config, skip the
+    # `Executor.run` path entirely. `Executor.run([])` would otherwise still
+    # write out an executor-info JSON to GCS, which is both pointless and an
+    # unwanted I/O side effect for a placeholder-free config.
+    if steps:
+        executor_info_base_path = os.path.join(resolved_prefix, "experiments")
+        executor = Executor(
+            prefix=resolved_prefix,
+            executor_info_base_path=executor_info_base_path,
+        )
+        output_paths: dict[ExecutorStep, str] = executor.run(steps=steps)
+    else:
+        output_paths = {}
+
+    if output_path is None:
+        current_output_path = getattr(config, "output_path", None)
+    else:
+        current_output_path = output_path
+
+    if isinstance(current_output_path, OutputName):
+        raise TypeError(
+            "materialize(config): output_path is still an OutputName "
+            "placeholder. The launcher / job-submission layer must resolve the "
+            "current step's output_path to a concrete string before calling "
+            "the worker function. Got: "
+            f"{current_output_path!r}"
+        )
+
+    return instantiate_config(
+        config=config,
+        output_path=current_output_path,
+        output_paths=output_paths,
+        prefix=resolved_prefix,
+    )

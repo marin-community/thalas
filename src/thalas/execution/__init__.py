@@ -1,4 +1,4 @@
-# Copyright 2025 The Thalas Authors
+# Copyright 2025-2026 The Thalas Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,28 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .context import (
+    ExecutorContext,
+    current_executor_context,
+    executor_context,
+)
 from .executor import (
-    THIS_OUTPUT_PATH,
     Executor,
     ExecutorInfo,
     ExecutorMainConfig,
+    compute_output_path,
+    executor_main,
+    materialize,
+    resolve_executor_step,
+    resolve_local_placeholders,
+    unwrap_versioned_value,
+    walk_config,
+)
+from .executor_step_status import (
+    STATUS_DEP_FAILED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    STATUS_SUCCESS,
+)
+from .types import (
+    THIS_OUTPUT_PATH,
     ExecutorStep,
     InputName,
     OutputName,
     VersionedValue,
     ensure_versioned,
-    executor_main,
     get_executor_step,
     output_path_of,
     this_output_path,
-    unwrap_versioned_value,
     versioned,
-)
-from .executor_step_status import (
-    STATUS_CANCELLED,
-    STATUS_DEP_FAILED,
-    STATUS_FAILED,
-    STATUS_RUNNING,
-    STATUS_SUCCESS,
-    STATUS_WAITING,
 )

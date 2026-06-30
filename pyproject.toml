@@ -1,7 +1,6 @@
 [build-system]
 requires = ["uv_build>=0.7.19,<0.8.0"]
 build-backend = "uv_build"
-requires-python = ">=3.11"
 
 [project]
 name = "thalas"
@@ -9,19 +8,24 @@ version = "0.1.0"
 readme = "README.md"
 license = {file = "LICENSE"}
 
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "draccus>=0.11.5",
-    "fasteners>=0.19",
-    "ray==2.45",
+    # Marin leaf packages. In the marin uv workspace these resolve to the local
+    # lib/* members via [tool.uv.sources]; standalone they resolve to the PyPI
+    # releases. Pinned loosely so the in-workspace version always satisfies them.
+    "marin-rigging",
+    "marin-fray",
+    "draccus>=0.11.6",
     "fsspec",
-    "toml",
+    "pydantic",
 ]
 
 [dependency-groups]
 
 test = [
-    "pydantic",
+    # marin-iris is only needed by test_step_runner (it exercises iris-backed
+    # job dispatch); the executor itself reaches iris transitively via fray.
+    "marin-iris",
     "pytest>=8.3.2",
     "pytest-cov",
     "pytest-timeout",
@@ -41,12 +45,12 @@ dev = [
 
 [tool.black]
 line-length = 121
-target-version = ["py310"]
+target-version = ["py311"]
 preview = true
 
 [tool.ruff]
 line-length = 121
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
@@ -54,9 +58,15 @@ ignore = ["F722", "B008", "UP015", "A005", "I001"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
+# Type stubs re-export names by design.
+"*.pyi" = ["E402", "F401", "E501"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
+
+[tool.uv]
+# The marin-* leaf packages publish only dev/pre-release builds to PyPI.
+prerelease = "allow"
 
 [tool.uv_build]
 package-dir = "src"

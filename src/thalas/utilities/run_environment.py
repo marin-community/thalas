@@ -17,7 +17,7 @@ import logging
 import os
 from copy import deepcopy
 
-from fray import GpuConfig, ResourceConfig, TpuConfig
+from fray.cluster import GpuConfig, ResourceConfig, TpuConfig
 
 logger = logging.getLogger(__name__)
 

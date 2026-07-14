@@ -32,7 +32,7 @@ from collections.abc import Callable, Generator
 from threading import Event, Thread
 from typing import TypeVar
 
-from rigging.distributed_lock import (
+from rigging.filesystem.distributed_lock import (
     HEARTBEAT_INTERVAL,
     LeaseLostError,
     create_lock,
@@ -63,7 +63,7 @@ class StatusFile:
       Contains {worker_id, timestamp}. Must be refreshed periodically.
     - Status file (simple text): Step state - SUCCESS, FAILED, DEP_FAILED, or RUNNING.
 
-    Lock acquisition and release delegate to ``rigging.distributed_lock``.
+    Lock acquisition and release delegate to ``rigging.filesystem.distributed_lock``.
     """
 
     def __init__(self, output_path: str, worker_id: str):

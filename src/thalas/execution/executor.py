@@ -98,11 +98,9 @@ import re
 import subprocess
 import sys
 import time
-import urllib.parse
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 import draccus
@@ -141,41 +139,6 @@ from thalas.execution.types import (
 from thalas.utilities.json_encoder import CustomJsonEncoder
 
 logger = logging.getLogger(__name__)
-
-_LOCAL_DATA_BROWSER_PORT_RE = re.compile(r"^\s*port\s*:\s*(\d+)\s*(?:#.*)?$")
-_LOCAL_DATA_BROWSER_CONFIG_REL = Path("data_browser") / "conf" / "local.conf"
-
-
-def _find_data_browser_local_conf(max_parents: int = 6) -> Path | None:
-    here = Path.cwd().resolve()
-    for _ in range(max_parents + 1):
-        candidate = here / _LOCAL_DATA_BROWSER_CONFIG_REL
-        if candidate.exists():
-            return candidate
-        parent = here.parent
-        if parent == here:
-            break
-        here = parent
-    return None
-
-
-def _get_local_data_browser_port(default: int = 5000) -> int:
-    # looks for the port in the local data browser config file
-    config_path = _find_data_browser_local_conf()
-    if config_path is None:
-        return default
-
-    try:
-        with config_path.open() as fp:
-            for line in fp:
-                match = _LOCAL_DATA_BROWSER_PORT_RE.match(line)
-                if match:
-                    return int(match.group(1))
-    except OSError:
-        return default
-
-    return default
-
 
 ConfigT = TypeVar("ConfigT")
 
@@ -1425,15 +1388,6 @@ class Executor:
             steps=self.step_infos,
         )
 
-    def get_experiment_url(self) -> str:
-        """Return the URL where the experiment can be viewed."""
-        if self.prefix.startswith("gs://"):
-            host = "https://marin.community/data-browser"
-        else:
-            host = f"http://localhost:{_get_local_data_browser_port()}"
-
-        return host + "/experiment?path=" + urllib.parse.quote(self.executor_info_path)
-
     def write_infos(self):
         """Output JSON files (one for the entire execution, one for each step)."""
 
@@ -1454,12 +1408,6 @@ class Executor:
 
         # Print where to find the executor info (experiments JSON)
         logger.info(f"Writing executor info to {self.executor_info_path}")
-        if not self.prefix.startswith("gs://"):
-            logger.info("Start data browser: cd data_browser && uv run python run-dev.py --config conf/local.conf")
-        logger.info("To view the experiment page, go to:")
-        logger.info("")
-        logger.info(self.get_experiment_url())
-        logger.info("")
         # Write out info for each step
         for step, info in zip(self.steps, executor_info_dict["steps"], strict=True):
             info_path = _get_info_path(self.output_paths[step])
@@ -1580,9 +1528,6 @@ def executor_main(
     if not config.dry_run:
         # print json path again so it's easy to copy
         logger.info(f"Executor info written to {executor.executor_info_path}")
-        if not executor.prefix.startswith("gs://"):
-            logger.info("Start data browser: cd data_browser && uv run python run-dev.py --config conf/local.conf")
-        logger.info(f"View the experiment at {executor.get_experiment_url()}")
 
 
 def _make_prefix_absolute_path(prefix, override_path):
